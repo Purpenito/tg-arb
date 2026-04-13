@@ -1,0 +1,5 @@
+{
+  "min_profit_pct": 0.2,
+  "min_volume_usdt": 10.0,
+  "filtered_symbols": null
+}
