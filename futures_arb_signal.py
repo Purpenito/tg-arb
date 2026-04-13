@@ -395,7 +395,8 @@ async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, 
                 continue
             if opp.net_funding_effect_pct < settings.min_funding_pct:
                 continue
-            if opp.net_profit_pct <= 0:
+            # Funding opportunities must also satisfy global minimum profit filter.
+            if opp.net_profit_pct < settings.min_profit_pct:
                 continue
         else:
             if opp.net_profit_pct < settings.min_profit_pct:
