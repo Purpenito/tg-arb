@@ -41,14 +41,18 @@ class Opportunity:
     sell_price: float
     buy_qty: float
     sell_qty: float
-    max_size_usdt: float
+    max_executable_size_usdt: float
+    min_24h_volume_usdt: float
     gross_spread_pct: float
     fees_pct: float
-    net_profit_pct: float
+    net_spread_pct: float
     funding_buy: Optional[float] = None
     funding_sell: Optional[float] = None
-    net_funding_effect_pct: Optional[float] = None
-    estimated_pnl_usdt: float = 0.0
+    net_funding_pct: float = 0.0
+    total_edge_pct: float = 0.0
+    estimated_spread_pnl_usdt: float = 0.0
+    estimated_funding_pnl_usdt: float = 0.0
+    estimated_total_pnl_usdt: float = 0.0
     buy_link: str = ""
     sell_link: str = ""
 
@@ -58,6 +62,7 @@ class Settings:
         self.min_profit_pct = cfg.DEFAULT_MIN_PROFIT_PCT
         self.min_volume_usdt = cfg.DEFAULT_MIN_VOLUME_USDT
         self.min_funding_pct = cfg.DEFAULT_MIN_FUNDING_PCT
+        self.min_24h_volume_usdt = cfg.DEFAULT_MIN_24H_VOLUME_USDT
         self.filtered_symbols: Optional[set[str]] = set(cfg.DEFAULT_SYMBOLS) if cfg.DEFAULT_SYMBOLS else None
         self.mode = cfg.DEFAULT_MODE
         self.log_max_mb = cfg.DEFAULT_LOG_MAX_MB
@@ -68,6 +73,7 @@ class Settings:
             "min_profit_pct": self.min_profit_pct,
             "min_volume_usdt": self.min_volume_usdt,
             "min_funding_pct": self.min_funding_pct,
+            "min_24h_volume_usdt": self.min_24h_volume_usdt,
             "filtered_symbols": sorted(self.filtered_symbols) if self.filtered_symbols else None,
             "mode": self.mode,
             "log_max_mb": self.log_max_mb,
@@ -78,6 +84,7 @@ class Settings:
         self.min_profit_pct = float(data.get("min_profit_pct", cfg.DEFAULT_MIN_PROFIT_PCT))
         self.min_volume_usdt = float(data.get("min_volume_usdt", cfg.DEFAULT_MIN_VOLUME_USDT))
         self.min_funding_pct = float(data.get("min_funding_pct", cfg.DEFAULT_MIN_FUNDING_PCT))
+        self.min_24h_volume_usdt = float(data.get("min_24h_volume_usdt", cfg.DEFAULT_MIN_24H_VOLUME_USDT))
         syms = data.get("filtered_symbols")
         self.filtered_symbols = {s.upper() for s in syms} if syms else None
         self.mode = str(data.get("mode", cfg.DEFAULT_MODE)).lower()
@@ -303,17 +310,60 @@ async def fetch_funding(session: aiohttp.ClientSession, exchange: str, symbol: s
     return None
 
 
-def calc_opportunity(symbol: str, mode: str, buy_exchange: str, sell_exchange: str, buy_book: MarketTop, sell_book: MarketTop, buy_market: str, sell_market: str, funding_buy: Optional[float] = None, funding_sell: Optional[float] = None) -> Opportunity:
+async def fetch_24h_volume(session: aiohttp.ClientSession, exchange: str, symbol: str, market_type: str) -> Optional[float]:
+    if exchange == "bybit":
+        category = "spot" if market_type == "spot" else "linear"
+        data = await fetch_json(session, f"https://api.bybit.com/v5/market/tickers?category={category}&symbol={symbol}USDT")
+        if data and data.get("retCode") == 0 and data["result"]["list"]:
+            item = data["result"]["list"][0]
+            if market_type == "spot":
+                return float(item.get("turnover24h", 0) or 0)
+            return float(item.get("turnover24h", 0) or 0)
+    elif exchange == "bingx":
+        if market_type == "spot":
+            data = await fetch_json(session, f"https://open-api.bingx.com/openApi/spot/v1/ticker/24hr?symbol={symbol}-USDT")
+            if data and int(data.get("code", 1)) == 0 and data.get("data"):
+                return float(data["data"].get("quoteVolume", 0) or 0)
+        else:
+            data = await fetch_json(session, f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}-USDT")
+            if data and data.get("code") == "0" and data.get("data"):
+                return float(data["data"].get("quoteVolume", 0) or data["data"].get("amount", 0) or 0)
+    elif exchange == "kucoin":
+        if market_type == "spot":
+            data = await fetch_json(session, f"https://api.kucoin.com/api/v1/market/stats?symbol={symbol}-USDT")
+            if data and data.get("code") == "200000" and data.get("data"):
+                return float(data["data"].get("volValue", 0) or 0)
+        else:
+            data = await fetch_json(session, f"https://api-futures.kucoin.com/api/v1/contracts/{symbol}USDTM")
+            if data and data.get("code") == "200000" and data.get("data"):
+                return float(data["data"].get("turnoverOf24h", 0) or 0)
+    return None
+
+
+def calc_opportunity(
+    symbol: str,
+    mode: str,
+    buy_exchange: str,
+    sell_exchange: str,
+    buy_book: MarketTop,
+    sell_book: MarketTop,
+    buy_market: str,
+    sell_market: str,
+    buy_24h_volume_usdt: float,
+    sell_24h_volume_usdt: float,
+    funding_buy: Optional[float] = None,
+    funding_sell: Optional[float] = None,
+) -> Opportunity:
     gross = ((sell_book.bid - buy_book.ask) / buy_book.ask) * 100
     fees_pct = (get_fee(buy_exchange, buy_market) + get_fee(sell_exchange, sell_market)) * 100
-    net = gross - fees_pct
+    net_spread_pct = gross - fees_pct
     max_size = min(buy_book.ask * buy_book.ask_qty, sell_book.bid * sell_book.bid_qty)
-
-    net_funding_pct = None
-    total_edge_pct = net
+    min_24h_volume = min(buy_24h_volume_usdt, sell_24h_volume_usdt)
+    net_funding_pct = 0.0
+    total_edge_pct = net_spread_pct
     if funding_buy is not None and funding_sell is not None:
         net_funding_pct = (funding_sell - funding_buy) * 100
-        total_edge_pct = net + net_funding_pct
+        total_edge_pct = net_spread_pct + net_funding_pct
 
     return Opportunity(
         symbol=symbol,
@@ -324,21 +374,24 @@ def calc_opportunity(symbol: str, mode: str, buy_exchange: str, sell_exchange: s
         sell_price=sell_book.bid,
         buy_qty=buy_book.ask_qty,
         sell_qty=sell_book.bid_qty,
-        max_size_usdt=max_size,
+        max_executable_size_usdt=max_size,
+        min_24h_volume_usdt=min_24h_volume,
         gross_spread_pct=gross,
         fees_pct=fees_pct,
-        net_profit_pct=total_edge_pct,
+        net_spread_pct=net_spread_pct,
         funding_buy=funding_buy,
         funding_sell=funding_sell,
-        net_funding_effect_pct=net_funding_pct,
-        estimated_pnl_usdt=max_size * (total_edge_pct / 100),
+        net_funding_pct=net_funding_pct,
+        total_edge_pct=total_edge_pct,
+        estimated_spread_pnl_usdt=max_size * (net_spread_pct / 100),
+        estimated_funding_pnl_usdt=max_size * (net_funding_pct / 100),
+        estimated_total_pnl_usdt=max_size * (total_edge_pct / 100),
         buy_link=market_link(buy_exchange, symbol, buy_market),
         sell_link=market_link(sell_exchange, symbol, sell_market),
     )
 
 
 def format_signal(opp: Opportunity) -> str:
-    net_fund = "N/A" if opp.net_funding_effect_pct is None else f"{opp.net_funding_effect_pct:+.4f}%"
     return (
         f"💎 <b>ARBITRAGE SIGNAL</b>\n"
         f"Coin: <b>{opp.symbol}/USDT</b>\n"
@@ -349,14 +402,18 @@ def format_signal(opp: Opportunity) -> str:
         f"🔴 SELL/SHORT: <b>{opp.sell_exchange.upper()}</b>\n"
         f"Price: <code>{opp.sell_price:.6f}</code> | Qty: <code>{opp.sell_qty:.4f}</code>\n"
         f"Link: {opp.sell_link}\n\n"
-        f"Max executable size: <code>{opp.max_size_usdt:,.2f} USDT</code>\n"
+        f"24h volume (min side): <code>{opp.min_24h_volume_usdt:,.2f} USDT</code>\n"
+        f"Max executable size: <code>{opp.max_executable_size_usdt:,.2f} USDT</code>\n"
         f"Gross spread: <code>{opp.gross_spread_pct:.4f}%</code>\n"
         f"Fees: <code>{opp.fees_pct:.4f}%</code>\n"
+        f"Spread edge: <code>{opp.net_spread_pct:+.4f}%</code>\n"
         f"Funding buy/sell: <code>{'N/A' if opp.funding_buy is None else f'{opp.funding_buy*100:.4f}%'} / {'N/A' if opp.funding_sell is None else f'{opp.funding_sell*100:.4f}%'}</code>\n"
         f"Funding explain: <code>{funding_text(opp.funding_buy, 'LONG')} | {funding_text(opp.funding_sell, 'SHORT')}</code>\n"
-        f"Net funding effect: <code>{net_fund}</code>\n"
-        f"Net result: <b>{opp.net_profit_pct:.4f}%</b>\n"
-        f"Estimated PnL: <b>{opp.estimated_pnl_usdt:,.2f} USDT</b>\n"
+        f"Funding edge: <code>{opp.net_funding_pct:+.4f}%</code>\n"
+        f"Total edge: <b>{opp.total_edge_pct:+.4f}%</b>\n"
+        f"Estimated spread PnL: <code>{opp.estimated_spread_pnl_usdt:,.2f} USDT</code>\n"
+        f"Estimated funding PnL: <code>{opp.estimated_funding_pnl_usdt:,.2f} USDT</code>\n"
+        f"Estimated total PnL: <b>{opp.estimated_total_pnl_usdt:,.2f} USDT</b>\n"
         f"Time: {ts_utc()}"
     )
 
@@ -367,6 +424,10 @@ async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, 
 
     opportunities: list[Opportunity] = []
 
+    async def get_side_24h(exchange: str, market: str) -> float:
+        value = await fetch_24h_volume(session, exchange, symbol, market)
+        return value if value is not None else 0.0
+
     if settings.mode in ("all", "spread", "futures_futures", "funding") and len(futures_ex) >= 2:
         books = {ex: book for ex, book in zip(futures_ex, await asyncio.gather(*[fetch_futures_book(session, ex, symbol) for ex in futures_ex])) if book}
         if len(books) >= 2:
@@ -374,10 +435,47 @@ async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, 
             short_ex = max(books, key=lambda x: books[x].bid)
             if long_ex != short_ex:
                 if settings.mode in ("all", "spread", "futures_futures"):
-                    opportunities.append(calc_opportunity(symbol, "futures_futures", long_ex, short_ex, books[long_ex], books[short_ex], "futures", "futures"))
+                    long_vol_24h, short_vol_24h = await asyncio.gather(
+                        get_side_24h(long_ex, "futures"),
+                        get_side_24h(short_ex, "futures"),
+                    )
+                    opportunities.append(
+                        calc_opportunity(
+                            symbol,
+                            "futures_futures",
+                            long_ex,
+                            short_ex,
+                            books[long_ex],
+                            books[short_ex],
+                            "futures",
+                            "futures",
+                            long_vol_24h,
+                            short_vol_24h,
+                        )
+                    )
                 if settings.mode in ("all", "funding"):
-                    f_long, f_short = await asyncio.gather(fetch_funding(session, long_ex, symbol), fetch_funding(session, short_ex, symbol))
-                    opportunities.append(calc_opportunity(symbol, "funding", long_ex, short_ex, books[long_ex], books[short_ex], "futures", "futures", f_long, f_short))
+                    f_long, f_short, long_vol_24h, short_vol_24h = await asyncio.gather(
+                        fetch_funding(session, long_ex, symbol),
+                        fetch_funding(session, short_ex, symbol),
+                        get_side_24h(long_ex, "futures"),
+                        get_side_24h(short_ex, "futures"),
+                    )
+                    opportunities.append(
+                        calc_opportunity(
+                            symbol,
+                            "funding",
+                            long_ex,
+                            short_ex,
+                            books[long_ex],
+                            books[short_ex],
+                            "futures",
+                            "futures",
+                            long_vol_24h,
+                            short_vol_24h,
+                            f_long,
+                            f_short,
+                        )
+                    )
 
     if settings.mode in ("all", "spread", "spot_futures") and spot_ex and futures_ex:
         spot_books = {ex: book for ex, book in zip(spot_ex, await asyncio.gather(*[fetch_spot_book(session, ex, symbol) for ex in spot_ex])) if book}
@@ -385,21 +483,35 @@ async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, 
         if spot_books and fut_books:
             buy_ex = min(spot_books, key=lambda x: spot_books[x].ask)
             sell_ex = max(fut_books, key=lambda x: fut_books[x].bid)
-            opportunities.append(calc_opportunity(symbol, "spot_futures", buy_ex, sell_ex, spot_books[buy_ex], fut_books[sell_ex], "spot", "futures"))
+            buy_vol_24h, sell_vol_24h = await asyncio.gather(
+                get_side_24h(buy_ex, "spot"),
+                get_side_24h(sell_ex, "futures"),
+            )
+            opportunities.append(
+                calc_opportunity(
+                    symbol,
+                    "spot_futures",
+                    buy_ex,
+                    sell_ex,
+                    spot_books[buy_ex],
+                    fut_books[sell_ex],
+                    "spot",
+                    "futures",
+                    buy_vol_24h,
+                    sell_vol_24h,
+                )
+            )
 
     for opp in opportunities:
-        if opp.max_size_usdt < settings.min_volume_usdt:
+        if opp.max_executable_size_usdt < settings.min_volume_usdt:
+            continue
+        if opp.min_24h_volume_usdt < settings.min_24h_volume_usdt:
             continue
         if opp.mode == "funding":
-            if opp.net_funding_effect_pct is None:
-                continue
-            if opp.net_funding_effect_pct < settings.min_funding_pct:
-                continue
-            # Funding opportunities must also satisfy global minimum profit filter.
-            if opp.net_profit_pct < settings.min_profit_pct:
+            if opp.total_edge_pct < settings.min_profit_pct:
                 continue
         else:
-            if opp.net_profit_pct < settings.min_profit_pct:
+            if opp.net_spread_pct < settings.min_profit_pct:
                 continue
 
         if on_cooldown(opp.symbol, opp.mode, opp.buy_exchange, opp.sell_exchange):
@@ -435,7 +547,8 @@ async def start_telegram_bot() -> Application:
             f"mode={settings.mode}\n"
             f"min_profit={settings.min_profit_pct}\n"
             f"min_volume={settings.min_volume_usdt}\n"
-            f"min_funding={settings.min_funding_pct}\n"
+            f"min_funding={settings.min_funding_pct} (info only)\n"
+            f"min_24h_volume={settings.min_24h_volume_usdt}\n"
             f"symbols={symbols}\n"
             f"log_max_mb={settings.log_max_mb}\n"
             f"log_backups={settings.log_backups}"
@@ -453,7 +566,7 @@ async def start_telegram_bot() -> Application:
             return
         args = context.args
         if len(args) < 2:
-            await update.message.reply_text("Usage: /set min_profit 0.2 | /set min_volume 1000 | /set min_funding 0.03 | /set symbols BTC,ETH | /set symbols ALL")
+            await update.message.reply_text("Usage: /set min_profit 0.2 | /set min_volume 1000 | /set min_24h_volume 500000 | /set min_funding 0.03 | /set symbols BTC,ETH | /set symbols ALL")
             return
         key = args[0].lower()
         value = " ".join(args[1:]).strip()
@@ -464,6 +577,8 @@ async def start_telegram_bot() -> Application:
                 settings.min_volume_usdt = float(value)
             elif key == "min_funding":
                 settings.min_funding_pct = float(value)
+            elif key == "min_24h_volume":
+                settings.min_24h_volume_usdt = float(value)
             elif key == "symbols":
                 if value.upper() == "ALL":
                     settings.filtered_symbols = None

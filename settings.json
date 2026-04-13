@@ -2,6 +2,7 @@
   "min_profit_pct": 0.2,
   "min_volume_usdt": 1000.0,
   "min_funding_pct": 0.03,
+  "min_24h_volume_usdt": 500000.0,
   "filtered_symbols": null,
   "mode": "all",
   "log_max_mb": 10,
