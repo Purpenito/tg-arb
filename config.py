@@ -1,24 +1,48 @@
-# config.py
+import os
+from typing import List
 
-# === TELEGRAM ===
-TELEGRAM_TOKEN = "API_TOKEN"
-TELEGRAM_CHAT_ID = "6726197521"
+from dotenv import load_dotenv
 
-# === ПРОКСИ (оставь пустым если не нужен) ===
-PROXY_LIST = []
+load_dotenv()
 
-# === НАСТРОЙКИ ПО УМОЛЧАНИЮ ===
-DEFAULT_MIN_PROFIT_PCT = 0.15
-DEFAULT_MIN_VOLUME_USDT = 5000
-DEFAULT_SYMBOLS = None  # None = все монеты; или ["BTC", "ETH"]
 
-# === БИРЖИ ===
+def _parse_proxy_list(raw: str | None) -> List[str]:
+    if not raw:
+        return []
+    items = [chunk.strip() for chunk in raw.replace(";", ",").split(",")]
+    return [item for item in items if item]
+
+
+# === TELEGRAM/SECRETS FROM ENV ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+PROXY_LIST = _parse_proxy_list(os.getenv("PROXY_LIST"))
+
+# === SETTINGS DEFAULTS ===
+DEFAULT_MIN_PROFIT_PCT = 0.20
+DEFAULT_MIN_VOLUME_USDT = 1000.0
+DEFAULT_MIN_FUNDING_PCT = 0.03
+DEFAULT_SYMBOLS = None  # None = all symbols, or e.g. ["BTC", "ETH", "SOL"]
+DEFAULT_MODE = "all"
+
+# === FEES (taker, decimal fraction) ===
 FEES = {
-    "bybit": 0.001,
-    "kucoin": 0.001,
-    "bingx": 0.00045,
+    "bybit": {"spot": 0.0010, "futures": 0.00055},
+    "bingx": {"spot": 0.0010, "futures": 0.00050},
+    "kucoin": {"spot": 0.0010, "futures": 0.00060},
 }
 
+# === SCANNER LOOP ===
 SCAN_INTERVAL = 8
 UPDATE_PAIRS_INTERVAL = 1800
 BATCH_SIZE = 20
+HTTP_TIMEOUT_SECONDS = 10
+
+# === LOGGING ===
+DEFAULT_LOG_MAX_MB = 10
+DEFAULT_LOG_BACKUPS = 5
+PRESTART_MAX_LOG_MB = 100
+
+# === COOLDOWN ===
+COOLDOWN_SPREAD_SECONDS = 90
+COOLDOWN_FUNDING_SECONDS = 300
