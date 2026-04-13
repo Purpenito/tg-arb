@@ -42,6 +42,8 @@ class Opportunity:
     buy_qty: float
     sell_qty: float
     max_executable_size_usdt: float
+    capital_usdt: float
+    trade_size_usdt: float
     min_24h_volume_usdt: float
     gross_spread_pct: float
     fees_pct: float
@@ -63,6 +65,8 @@ class Settings:
         self.min_volume_usdt = cfg.DEFAULT_MIN_VOLUME_USDT
         self.min_funding_pct = cfg.DEFAULT_MIN_FUNDING_PCT
         self.min_24h_volume_usdt = cfg.DEFAULT_MIN_24H_VOLUME_USDT
+        self.capital_usdt = cfg.DEFAULT_CAPITAL_USDT
+        self.min_trade_size_usdt = cfg.DEFAULT_MIN_TRADE_SIZE_USDT
         self.filtered_symbols: Optional[set[str]] = set(cfg.DEFAULT_SYMBOLS) if cfg.DEFAULT_SYMBOLS else None
         self.mode = cfg.DEFAULT_MODE
         self.log_max_mb = cfg.DEFAULT_LOG_MAX_MB
@@ -74,6 +78,8 @@ class Settings:
             "min_volume_usdt": self.min_volume_usdt,
             "min_funding_pct": self.min_funding_pct,
             "min_24h_volume_usdt": self.min_24h_volume_usdt,
+            "capital_usdt": self.capital_usdt,
+            "min_trade_size_usdt": self.min_trade_size_usdt,
             "filtered_symbols": sorted(self.filtered_symbols) if self.filtered_symbols else None,
             "mode": self.mode,
             "log_max_mb": self.log_max_mb,
@@ -85,6 +91,8 @@ class Settings:
         self.min_volume_usdt = float(data.get("min_volume_usdt", cfg.DEFAULT_MIN_VOLUME_USDT))
         self.min_funding_pct = float(data.get("min_funding_pct", cfg.DEFAULT_MIN_FUNDING_PCT))
         self.min_24h_volume_usdt = float(data.get("min_24h_volume_usdt", cfg.DEFAULT_MIN_24H_VOLUME_USDT))
+        self.capital_usdt = float(data.get("capital_usdt", cfg.DEFAULT_CAPITAL_USDT))
+        self.min_trade_size_usdt = float(data.get("min_trade_size_usdt", cfg.DEFAULT_MIN_TRADE_SIZE_USDT))
         syms = data.get("filtered_symbols")
         self.filtered_symbols = {s.upper() for s in syms} if syms else None
         self.mode = str(data.get("mode", cfg.DEFAULT_MODE)).lower()
@@ -351,6 +359,7 @@ def calc_opportunity(
     sell_market: str,
     buy_24h_volume_usdt: float,
     sell_24h_volume_usdt: float,
+    capital_usdt: float,
     funding_buy: Optional[float] = None,
     funding_sell: Optional[float] = None,
 ) -> Opportunity:
@@ -358,6 +367,7 @@ def calc_opportunity(
     fees_pct = (get_fee(buy_exchange, buy_market) + get_fee(sell_exchange, sell_market)) * 100
     net_spread_pct = gross - fees_pct
     max_size = min(buy_book.ask * buy_book.ask_qty, sell_book.bid * sell_book.bid_qty)
+    trade_size = min(capital_usdt, max_size)
     min_24h_volume = min(buy_24h_volume_usdt, sell_24h_volume_usdt)
     net_funding_pct = 0.0
     total_edge_pct = net_spread_pct
@@ -375,6 +385,8 @@ def calc_opportunity(
         buy_qty=buy_book.ask_qty,
         sell_qty=sell_book.bid_qty,
         max_executable_size_usdt=max_size,
+        capital_usdt=capital_usdt,
+        trade_size_usdt=trade_size,
         min_24h_volume_usdt=min_24h_volume,
         gross_spread_pct=gross,
         fees_pct=fees_pct,
@@ -383,9 +395,9 @@ def calc_opportunity(
         funding_sell=funding_sell,
         net_funding_pct=net_funding_pct,
         total_edge_pct=total_edge_pct,
-        estimated_spread_pnl_usdt=max_size * (net_spread_pct / 100),
-        estimated_funding_pnl_usdt=max_size * (net_funding_pct / 100),
-        estimated_total_pnl_usdt=max_size * (total_edge_pct / 100),
+        estimated_spread_pnl_usdt=trade_size * (net_spread_pct / 100),
+        estimated_funding_pnl_usdt=trade_size * (net_funding_pct / 100),
+        estimated_total_pnl_usdt=trade_size * (total_edge_pct / 100),
         buy_link=market_link(buy_exchange, symbol, buy_market),
         sell_link=market_link(sell_exchange, symbol, sell_market),
     )
@@ -402,8 +414,10 @@ def format_signal(opp: Opportunity) -> str:
         f"🔴 SELL/SHORT: <b>{opp.sell_exchange.upper()}</b>\n"
         f"Price: <code>{opp.sell_price:.6f}</code> | Qty: <code>{opp.sell_qty:.4f}</code>\n"
         f"Link: {opp.sell_link}\n\n"
+        f"Capital: <code>{opp.capital_usdt:,.2f} USDT</code>\n"
         f"24h volume (min side): <code>{opp.min_24h_volume_usdt:,.2f} USDT</code>\n"
         f"Max executable size: <code>{opp.max_executable_size_usdt:,.2f} USDT</code>\n"
+        f"Trade size: <code>{opp.trade_size_usdt:,.2f} USDT</code>\n"
         f"Gross spread: <code>{opp.gross_spread_pct:.4f}%</code>\n"
         f"Fees: <code>{opp.fees_pct:.4f}%</code>\n"
         f"Spread edge: <code>{opp.net_spread_pct:+.4f}%</code>\n"
@@ -451,6 +465,7 @@ async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, 
                             "futures",
                             long_vol_24h,
                             short_vol_24h,
+                            settings.capital_usdt,
                         )
                     )
                 if settings.mode in ("all", "funding"):
@@ -472,6 +487,7 @@ async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, 
                             "futures",
                             long_vol_24h,
                             short_vol_24h,
+                            settings.capital_usdt,
                             f_long,
                             f_short,
                         )
@@ -499,11 +515,14 @@ async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, 
                     "futures",
                     buy_vol_24h,
                     sell_vol_24h,
+                    settings.capital_usdt,
                 )
             )
 
     for opp in opportunities:
         if opp.max_executable_size_usdt < settings.min_volume_usdt:
+            continue
+        if opp.trade_size_usdt < settings.min_trade_size_usdt:
             continue
         if opp.min_24h_volume_usdt < settings.min_24h_volume_usdt:
             continue
@@ -544,6 +563,8 @@ async def start_telegram_bot() -> Application:
             "/set min_profit 0.2\n"
             "/set min_volume 1000\n"
             "/set min_24h_volume 1000000\n"
+            "/set min_trade_size 50\n"
+            "/set capital 1000\n"
             "/set min_funding 0.03\n"
             "/set symbols BTC,ETH,SOL\n"
             "/set symbols ALL\n"
@@ -561,6 +582,8 @@ async def start_telegram_bot() -> Application:
             f"Мин. профит: {settings.min_profit_pct:.3f}%\n"
             f"Мин. исполнимый объём: ${settings.min_volume_usdt:,.0f} USDT\n"
             f"Мин. объём за 24ч: ${settings.min_24h_volume_usdt:,.0f} USDT\n"
+            f"Мин. размер сделки: ${settings.min_trade_size_usdt:,.0f} USDT\n"
+            f"Капитал: ${settings.capital_usdt:,.0f} USDT\n"
             f"Мин. funding: {settings.min_funding_pct:.3f}% (info only)\n"
             f"Символы: {symbols}\n"
             f"log_max_mb={settings.log_max_mb}\n"
@@ -584,6 +607,8 @@ async def start_telegram_bot() -> Application:
                 "/set min_profit 0.2\n"
                 "/set min_volume 1000\n"
                 "/set min_24h_volume 1000000\n"
+                "/set min_trade_size 50\n"
+                "/set capital 1000\n"
                 "/set min_funding 0.03\n"
                 "/set symbols BTC,ETH\n"
                 "/set symbols ALL"
@@ -600,6 +625,10 @@ async def start_telegram_bot() -> Application:
                 settings.min_funding_pct = float(value)
             elif key == "min_24h_volume":
                 settings.min_24h_volume_usdt = float(value)
+            elif key == "min_trade_size":
+                settings.min_trade_size_usdt = float(value)
+            elif key == "capital":
+                settings.capital_usdt = float(value)
             elif key == "symbols":
                 if value.upper() == "ALL":
                     settings.filtered_symbols = None

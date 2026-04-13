@@ -57,6 +57,8 @@ python3 futures_arb_signal.py
 - `/set min_volume 1000`
 - `/set min_funding 0.03`
 - `/set min_24h_volume 500000`
+- `/set min_trade_size 50`
+- `/set capital 1000`
 - `/set symbols BTC,ETH,SOL`
 - `/set symbols ALL`
 - `/mode spread`
