@@ -1,5 +1,19 @@
 {
   "min_profit_pct": 0.2,
-  "min_volume_usdt": 10.0,
-  "filtered_symbols": null
+  "min_volume_usdt": 1000.0,
+  "min_funding_pct": 0.03,
+  "min_24h_volume_usdt": 500000.0,
+  "capital_usdt": 1000.0,
+  "min_trade_size_usdt": 50.0,
+  "max_negative_entry_spread_pct": 0.2,
+  "filtered_symbols": null,
+  "enabled_exchanges": ["bybit", "bingx", "kucoin"],
+  "mode": "all",
+  "auto_alerts_enabled": false,
+  "cooldown_minutes": 2,
+  "max_results": 5,
+  "only_positive_signals": true,
+  "funding_weight": 0.5,
+  "log_max_mb": 10,
+  "log_backups": 5
 }
