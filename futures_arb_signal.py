@@ -176,11 +176,21 @@ def funding_text(rate: Optional[float], side: str) -> str:
     if rate is None:
         return "N/A"
     pct = abs(rate) * 100
+    side = side.upper()
+
+    if side not in {"LONG", "SHORT"}:
+        return f"{side} funding {rate * 100:.4f}%"
+
     if rate > 0:
-        return f"{side} pays {pct:.4f}%"
-    if rate < 0:
-        return f"{side} receives {pct:.4f}%"
-    return f"{side} funding 0.0000%"
+        # Positive funding: LONG pays SHORT.
+        action = "pays" if side == "LONG" else "receives"
+    elif rate < 0:
+        # Negative funding: SHORT pays LONG.
+        action = "receives" if side == "LONG" else "pays"
+    else:
+        return f"{side} funding 0.0000%"
+
+    return f"{side} {action} {pct:.4f}%"
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[dict[str, Any]]:
