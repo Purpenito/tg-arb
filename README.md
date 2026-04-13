@@ -59,6 +59,12 @@ python3 futures_arb_signal.py
 - `/set min_24h_volume 500000`
 - `/set min_trade_size 50`
 - `/set capital 1000`
+- `/set alerts on`
+- `/set cooldown 2`
+- `/set max_results 5`
+- `/set exchanges bybit,bingx,kucoin`
+- `/debug ETH`
+- `/status`
 - `/set symbols BTC,ETH,SOL`
 - `/set symbols ALL`
 - `/mode spread`
@@ -79,6 +85,15 @@ cd /path/to/tg-arb
 source .venv/bin/activate
 python3 futures_arb_signal.py
 # detach: Ctrl+b then d
+```
+
+## Пример запуска через nohup
+
+```bash
+cd /path/to/tg-arb
+source .venv/bin/activate
+nohup python3 futures_arb_signal.py > bot.out 2>&1 &
+tail -f bot.out
 ```
 
 ## systemd service

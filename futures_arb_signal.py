@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import aiohttp
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import config as cfg
 from proxy_manager import TelegramProxyManager
@@ -68,6 +68,13 @@ class Settings:
         self.min_24h_volume_usdt = cfg.DEFAULT_MIN_24H_VOLUME_USDT
         self.capital_usdt = cfg.DEFAULT_CAPITAL_USDT
         self.min_trade_size_usdt = cfg.DEFAULT_MIN_TRADE_SIZE_USDT
+        self.max_negative_entry_spread_pct = cfg.DEFAULT_MAX_NEGATIVE_ENTRY_SPREAD_PCT
+        self.enabled_exchanges = list(cfg.DEFAULT_ENABLED_EXCHANGES)
+        self.auto_alerts_enabled = cfg.DEFAULT_AUTO_ALERTS_ENABLED
+        self.cooldown_minutes = cfg.DEFAULT_COOLDOWN_MINUTES
+        self.max_results = cfg.DEFAULT_MAX_RESULTS
+        self.only_positive_signals = cfg.DEFAULT_ONLY_POSITIVE_SIGNALS
+        self.funding_weight = cfg.DEFAULT_FUNDING_WEIGHT
         self.filtered_symbols: Optional[set[str]] = set(cfg.DEFAULT_SYMBOLS) if cfg.DEFAULT_SYMBOLS else None
         self.mode = cfg.DEFAULT_MODE
         self.log_max_mb = cfg.DEFAULT_LOG_MAX_MB
@@ -81,8 +88,15 @@ class Settings:
             "min_24h_volume_usdt": self.min_24h_volume_usdt,
             "capital_usdt": self.capital_usdt,
             "min_trade_size_usdt": self.min_trade_size_usdt,
+            "max_negative_entry_spread_pct": self.max_negative_entry_spread_pct,
+            "enabled_exchanges": self.enabled_exchanges,
             "filtered_symbols": sorted(self.filtered_symbols) if self.filtered_symbols else None,
             "mode": self.mode,
+            "auto_alerts_enabled": self.auto_alerts_enabled,
+            "cooldown_minutes": self.cooldown_minutes,
+            "max_results": self.max_results,
+            "only_positive_signals": self.only_positive_signals,
+            "funding_weight": self.funding_weight,
             "log_max_mb": self.log_max_mb,
             "log_backups": self.log_backups,
         }
@@ -94,9 +108,17 @@ class Settings:
         self.min_24h_volume_usdt = float(data.get("min_24h_volume_usdt", cfg.DEFAULT_MIN_24H_VOLUME_USDT))
         self.capital_usdt = float(data.get("capital_usdt", cfg.DEFAULT_CAPITAL_USDT))
         self.min_trade_size_usdt = float(data.get("min_trade_size_usdt", cfg.DEFAULT_MIN_TRADE_SIZE_USDT))
+        self.max_negative_entry_spread_pct = float(data.get("max_negative_entry_spread_pct", cfg.DEFAULT_MAX_NEGATIVE_ENTRY_SPREAD_PCT))
+        enabled_exchanges = data.get("enabled_exchanges", cfg.DEFAULT_ENABLED_EXCHANGES)
+        self.enabled_exchanges = [str(ex).lower() for ex in enabled_exchanges if str(ex).lower() in EXCHANGES] or list(cfg.DEFAULT_ENABLED_EXCHANGES)
         syms = data.get("filtered_symbols")
         self.filtered_symbols = {s.upper() for s in syms} if syms else None
         self.mode = str(data.get("mode", cfg.DEFAULT_MODE)).lower()
+        self.auto_alerts_enabled = bool(data.get("auto_alerts_enabled", cfg.DEFAULT_AUTO_ALERTS_ENABLED))
+        self.cooldown_minutes = max(1, int(data.get("cooldown_minutes", cfg.DEFAULT_COOLDOWN_MINUTES)))
+        self.max_results = max(1, int(data.get("max_results", cfg.DEFAULT_MAX_RESULTS)))
+        self.only_positive_signals = bool(data.get("only_positive_signals", cfg.DEFAULT_ONLY_POSITIVE_SIGNALS))
+        self.funding_weight = float(data.get("funding_weight", cfg.DEFAULT_FUNDING_WEIGHT))
         self.log_max_mb = max(1, int(data.get("log_max_mb", cfg.DEFAULT_LOG_MAX_MB)))
         self.log_backups = max(1, int(data.get("log_backups", cfg.DEFAULT_LOG_BACKUPS)))
 
@@ -124,12 +146,15 @@ class Settings:
 
 settings = Settings()
 last_signal_times: dict[str, float] = {}
+latest_symbol_debug: dict[str, dict[str, Any]] = {}
+latest_candidates: dict[str, Opportunity] = {}
 
 
 class Diagnostics:
     def __init__(self) -> None:
         self.symbols_checked = 0
         self.signals_sent = 0
+        self.funding_candidates = 0
         self.participation_count: Counter[str] = Counter()
         self.long_count: Counter[str] = Counter()
         self.short_count: Counter[str] = Counter()
@@ -143,10 +168,11 @@ class Diagnostics:
 
     def summary(self, cycle_no: int) -> None:
         logger.info(
-            "SUMMARY cycle=%s symbols_checked=%s signals_sent=%s participation=%s long=%s short=%s cuts=%s",
+            "SUMMARY cycle=%s symbols_checked=%s signals_sent=%s funding_candidates=%s participation=%s long=%s short=%s cuts=%s",
             cycle_no,
             self.symbols_checked,
             self.signals_sent,
+            self.funding_candidates,
             dict(self.participation_count),
             dict(self.long_count),
             dict(self.short_count),
@@ -175,7 +201,7 @@ def setup_logging(max_mb: int, backups: int) -> None:
 
 
 def get_mode_cooldown(mode: str) -> int:
-    return cfg.COOLDOWN_FUNDING_SECONDS if mode == "funding" else cfg.COOLDOWN_SPREAD_SECONDS
+    return int(settings.cooldown_minutes * 60)
 
 
 def signal_key(symbol: str, mode: str, buy_exchange: str, sell_exchange: str) -> str:
@@ -428,7 +454,7 @@ def calc_opportunity(
     total_edge_pct = net_spread_pct
     if funding_buy is not None and funding_sell is not None:
         net_funding_pct = (funding_sell - funding_buy) * 100
-        total_edge_pct = net_spread_pct + net_funding_pct
+        total_edge_pct = net_spread_pct + (net_funding_pct * settings.funding_weight)
 
     return Opportunity(
         symbol=symbol,
@@ -495,10 +521,20 @@ async def scan_symbol(
     diagnostics: Diagnostics,
 ) -> None:
     diagnostics.symbols_checked += 1
-    futures_ex = [ex for ex in EXCHANGES if symbol in maps["futures"][ex]]
-    spot_ex = [ex for ex in EXCHANGES if symbol in maps["spot"][ex]]
+    allowed_exchanges = set(settings.enabled_exchanges)
+    futures_ex = [ex for ex in EXCHANGES if ex in allowed_exchanges and symbol in maps["futures"][ex]]
+    spot_ex = [ex for ex in EXCHANGES if ex in allowed_exchanges and symbol in maps["spot"][ex]]
+    debug_info: dict[str, Any] = {
+        "symbol": symbol,
+        "futures_exchanges": futures_ex,
+        "spot_exchanges": spot_ex,
+        "cuts": [],
+        "best_candidate": None,
+    }
     for exchange in EXCHANGES:
-        if exchange not in futures_ex and exchange not in spot_ex:
+        if exchange not in allowed_exchanges:
+            diagnostics.cut(exchange, "exchange disabled")
+        elif exchange not in futures_ex and exchange not in spot_ex:
             diagnostics.cut(exchange, "no symbol")
 
     opportunities: list[Opportunity] = []
@@ -516,6 +552,7 @@ async def scan_symbol(
                 diagnostics.participation_count[ex] += 1
             else:
                 diagnostics.cut(ex, reason or "no orderbook")
+                debug_info["cuts"].append(f"{ex}: {reason or 'no orderbook'}")
         logger.info("ORDERBOOK futures symbol=%s available=%s", symbol, sorted(books.keys()))
         if len(books) >= 2:
             long_ex = min(books, key=lambda x: books[x].ask)
@@ -577,12 +614,14 @@ async def scan_symbol(
                 diagnostics.participation_count[ex] += 1
             else:
                 diagnostics.cut(ex, reason or "no orderbook")
+                debug_info["cuts"].append(f"{ex}: {reason or 'no orderbook'}")
         for ex, (book, reason) in zip(futures_ex, fut_results):
             if book:
                 fut_books[ex] = book
                 diagnostics.participation_count[ex] += 1
             else:
                 diagnostics.cut(ex, reason or "no orderbook")
+                debug_info["cuts"].append(f"{ex}: {reason or 'no orderbook'}")
         logger.info("ORDERBOOK spot symbol=%s available=%s | futures available=%s", symbol, sorted(spot_books.keys()), sorted(fut_books.keys()))
         if spot_books and fut_books:
             buy_ex = min(spot_books, key=lambda x: spot_books[x].ask)
@@ -609,33 +648,69 @@ async def scan_symbol(
 
     for opp in opportunities:
         if opp.max_executable_size_usdt < settings.min_volume_usdt:
-            diagnostics.cut(opp.buy_exchange, "low top-of-book volume")
-            diagnostics.cut(opp.sell_exchange, "low top-of-book volume")
+            diagnostics.cut(opp.buy_exchange, f"low top-of-book volume got={opp.max_executable_size_usdt:.2f} required={settings.min_volume_usdt:.2f}")
+            diagnostics.cut(opp.sell_exchange, f"low top-of-book volume got={opp.max_executable_size_usdt:.2f} required={settings.min_volume_usdt:.2f}")
             continue
         if opp.trade_size_usdt < settings.min_trade_size_usdt:
+            diagnostics.cut(opp.buy_exchange, f"low trade_size_usdt got={opp.trade_size_usdt:.2f} required={settings.min_trade_size_usdt:.2f}")
+            diagnostics.cut(opp.sell_exchange, f"low trade_size_usdt got={opp.trade_size_usdt:.2f} required={settings.min_trade_size_usdt:.2f}")
             continue
         if opp.min_24h_volume_usdt < settings.min_24h_volume_usdt:
-            diagnostics.cut(opp.buy_exchange, "low 24h volume")
-            diagnostics.cut(opp.sell_exchange, "low 24h volume")
+            diagnostics.cut(opp.buy_exchange, f"low 24h volume got={opp.min_24h_volume_usdt:.2f} required={settings.min_24h_volume_usdt:.2f}")
+            diagnostics.cut(opp.sell_exchange, f"low 24h volume got={opp.min_24h_volume_usdt:.2f} required={settings.min_24h_volume_usdt:.2f}")
             continue
         if opp.net_spread_pct < 0:
-            diagnostics.cut(opp.buy_exchange, "negative spread after fees")
-            diagnostics.cut(opp.sell_exchange, "negative spread after fees")
+            diagnostics.cut(opp.buy_exchange, f"negative spread after fees gross={opp.gross_spread_pct:.4f} fees={opp.fees_pct:.4f} net={opp.net_spread_pct:.4f}")
+            diagnostics.cut(opp.sell_exchange, f"negative spread after fees gross={opp.gross_spread_pct:.4f} fees={opp.fees_pct:.4f} net={opp.net_spread_pct:.4f}")
             continue
         if opp.mode == "funding":
+            diagnostics.funding_candidates += 1
+            if opp.net_spread_pct < -settings.max_negative_entry_spread_pct:
+                diagnostics.cut(opp.buy_exchange, f"bad funding edge entry spread={opp.net_spread_pct:.4f} limit=-{settings.max_negative_entry_spread_pct:.4f}")
+                diagnostics.cut(opp.sell_exchange, f"bad funding edge entry spread={opp.net_spread_pct:.4f} limit=-{settings.max_negative_entry_spread_pct:.4f}")
+                continue
+            if opp.net_funding_pct < settings.min_funding_pct:
+                diagnostics.cut(opp.buy_exchange, f"bad funding edge got={opp.net_funding_pct:.4f} required={settings.min_funding_pct:.4f}")
+                diagnostics.cut(opp.sell_exchange, f"bad funding edge got={opp.net_funding_pct:.4f} required={settings.min_funding_pct:.4f}")
+                continue
             if opp.total_edge_pct < settings.min_profit_pct:
+                diagnostics.cut(opp.buy_exchange, f"bad total edge got={opp.total_edge_pct:.4f} required={settings.min_profit_pct:.4f}")
+                diagnostics.cut(opp.sell_exchange, f"bad total edge got={opp.total_edge_pct:.4f} required={settings.min_profit_pct:.4f}")
                 continue
         else:
             if opp.net_spread_pct < settings.min_profit_pct:
+                diagnostics.cut(opp.buy_exchange, f"bad spread edge got={opp.net_spread_pct:.4f} required={settings.min_profit_pct:.4f}")
+                diagnostics.cut(opp.sell_exchange, f"bad spread edge got={opp.net_spread_pct:.4f} required={settings.min_profit_pct:.4f}")
                 continue
+        if settings.only_positive_signals and opp.estimated_total_pnl_usdt <= 0:
+            diagnostics.cut(opp.buy_exchange, f"only positive signals pnl={opp.estimated_total_pnl_usdt:.4f}")
+            diagnostics.cut(opp.sell_exchange, f"only positive signals pnl={opp.estimated_total_pnl_usdt:.4f}")
+            continue
 
         if on_cooldown(opp.symbol, opp.mode, opp.buy_exchange, opp.sell_exchange):
             continue
 
+        prev = latest_candidates.get(opp.symbol)
+        if prev is None or opp.total_edge_pct > prev.total_edge_pct:
+            latest_candidates[opp.symbol] = opp
+
+        debug_info["best_candidate"] = {
+            "mode": opp.mode,
+            "buy_exchange": opp.buy_exchange,
+            "sell_exchange": opp.sell_exchange,
+            "net_spread_pct": opp.net_spread_pct,
+            "net_funding_pct": opp.net_funding_pct,
+            "total_edge_pct": opp.total_edge_pct,
+            "trade_size_usdt": opp.trade_size_usdt,
+        }
         diagnostics.long_count[opp.buy_exchange] += 1
         diagnostics.short_count[opp.sell_exchange] += 1
         diagnostics.signals_sent += 1
-        await tg.send_message(cfg.TELEGRAM_CHAT_ID, format_signal(opp))
+        latest_symbol_debug[symbol.upper()] = debug_info
+        if settings.auto_alerts_enabled:
+            await tg.send_message(cfg.TELEGRAM_CHAT_ID, format_signal(opp))
+    if symbol.upper() not in latest_symbol_debug:
+        latest_symbol_debug[symbol.upper()] = debug_info
 
 
 async def start_telegram_bot() -> Application:
@@ -646,16 +721,43 @@ async def start_telegram_bot() -> Application:
 
     async def auth_check(update: Update) -> bool:
         chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+        message = update.effective_message
         if chat_id != allowed_chat_id:
-            if update.message:
-                await update.message.reply_text("🔒 Access denied")
+            if message:
+                await message.reply_text("🔒 Access denied")
             return False
         return True
+
+    def main_menu() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Проверить всё", callback_data="scan_all"), InlineKeyboardButton("Только spread", callback_data="scan_spread")],
+            [InlineKeyboardButton("Только funding", callback_data="scan_funding"), InlineKeyboardButton("Только spot-futures", callback_data="scan_spot_futures")],
+            [InlineKeyboardButton("Уведомления ВКЛ/ВЫКЛ", callback_data="toggle_alerts"), InlineKeyboardButton("Статус", callback_data="status")],
+            [InlineKeyboardButton("Помощь", callback_data="help")],
+        ])
+
+    async def send_top_signals(message, forced_mode: Optional[str] = None) -> None:
+        if not latest_candidates:
+            await message.reply_text("Сигналов по текущим фильтрам пока нет. Нажмите позже.")
+            return
+        filtered = list(latest_candidates.values())
+        if forced_mode:
+            if forced_mode == "spread":
+                filtered = [o for o in filtered if o.mode in {"futures_futures", "spot_futures"}]
+            else:
+                filtered = [o for o in filtered if o.mode == forced_mode]
+        filtered.sort(key=lambda x: x.total_edge_pct, reverse=True)
+        limited = filtered[: settings.max_results]
+        for opp in limited:
+            await message.reply_text(format_signal(opp), parse_mode="HTML", disable_web_page_preview=True)
 
     async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
-        await update.message.reply_text(
+        message = update.effective_message
+        if not message:
+            return
+        await message.reply_text(
             "Bot online.\n"
             "Commands:\n"
             "/show\n"
@@ -665,18 +767,27 @@ async def start_telegram_bot() -> Application:
             "/set min_trade_size 50\n"
             "/set capital 1000\n"
             "/set min_funding 0.03\n"
+            "/set cooldown 2\n"
+            "/set max_results 5\n"
+            "/set alerts on|off\n"
             "/set symbols BTC,ETH,SOL\n"
             "/set symbols ALL\n"
             "/mode spread|funding|spot_futures|futures_futures|all\n"
+            "/debug ETH\n"
+            "/status\n"
             "/reset",
             parse_mode="HTML",
+            reply_markup=main_menu(),
         )
 
     async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
+        message = update.effective_message
+        if not message:
+            return
         symbols = "ALL" if not settings.filtered_symbols else ",".join(sorted(settings.filtered_symbols))
-        await update.message.reply_text(
+        await message.reply_text(
             f"Режим: {settings.mode}\n"
             f"Мин. профит: {settings.min_profit_pct:.3f}%\n"
             f"Мин. исполнимый объём: ${settings.min_volume_usdt:,.0f} USDT\n"
@@ -684,6 +795,12 @@ async def start_telegram_bot() -> Application:
             f"Мин. размер сделки: ${settings.min_trade_size_usdt:,.0f} USDT\n"
             f"Капитал: ${settings.capital_usdt:,.0f} USDT\n"
             f"Мин. funding: {settings.min_funding_pct:.3f}% (info only)\n"
+            f"Funding weight: {settings.funding_weight:.2f}\n"
+            f"Max negative entry spread (funding): {settings.max_negative_entry_spread_pct:.3f}%\n"
+            f"Активные биржи: {', '.join(settings.enabled_exchanges)}\n"
+            f"Автоуведомления: {'ВКЛ' if settings.auto_alerts_enabled else 'ВЫКЛ'}\n"
+            f"Cooldown: {settings.cooldown_minutes} мин\n"
+            f"Max результатов: {settings.max_results}\n"
             f"Символы: {symbols}\n"
             f"log_max_mb={settings.log_max_mb}\n"
             f"log_backups={settings.log_backups}"
@@ -692,16 +809,22 @@ async def start_telegram_bot() -> Application:
     async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
+        message = update.effective_message
+        if not message:
+            return
         settings.reset_to_default()
         settings.save_to_file(SETTINGS_FILE)
-        await update.message.reply_text("Settings reset")
+        await message.reply_text("Settings reset", reply_markup=main_menu())
 
     async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
+        message = update.effective_message
+        if not message:
+            return
         args = context.args
         if len(args) < 2:
-            await update.message.reply_text(
+            await message.reply_text(
                 "Usage:\n"
                 "/set min_profit 0.2\n"
                 "/set min_volume 1000\n"
@@ -709,6 +832,12 @@ async def start_telegram_bot() -> Application:
                 "/set min_trade_size 50\n"
                 "/set capital 1000\n"
                 "/set min_funding 0.03\n"
+                "/set max_negative_entry_spread 0.2\n"
+                "/set funding_weight 0.5\n"
+                "/set exchanges bybit,bingx,kucoin\n"
+                "/set alerts on\n"
+                "/set cooldown 2\n"
+                "/set max_results 5\n"
                 "/set symbols BTC,ETH\n"
                 "/set symbols ALL"
             )
@@ -728,33 +857,108 @@ async def start_telegram_bot() -> Application:
                 settings.min_trade_size_usdt = float(value)
             elif key == "capital":
                 settings.capital_usdt = float(value)
+            elif key == "max_negative_entry_spread":
+                settings.max_negative_entry_spread_pct = float(value)
+            elif key == "funding_weight":
+                settings.funding_weight = float(value)
+            elif key == "cooldown":
+                settings.cooldown_minutes = max(1, int(float(value)))
+            elif key == "max_results":
+                settings.max_results = max(1, int(float(value)))
+            elif key == "alerts":
+                settings.auto_alerts_enabled = value.lower() in {"on", "1", "true", "yes", "вкл"}
+            elif key == "exchanges":
+                items = [x.strip().lower() for x in value.split(",") if x.strip()]
+                selected = [x for x in items if x in EXCHANGES]
+                if selected:
+                    settings.enabled_exchanges = selected
             elif key == "symbols":
                 if value.upper() == "ALL":
                     settings.filtered_symbols = None
                 else:
                     settings.filtered_symbols = {s.strip().upper() for s in value.split(",") if s.strip()}
             else:
-                await update.message.reply_text("Unknown key")
+                await message.reply_text("Unknown key")
                 return
             settings.save_to_file(SETTINGS_FILE)
-            await update.message.reply_text("Updated")
+            await message.reply_text("Updated")
         except ValueError:
-            await update.message.reply_text("Invalid value")
+            await message.reply_text("Invalid value")
 
     async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
+        message = update.effective_message
+        if not message:
+            return
         if not context.args:
-            await update.message.reply_text("Usage: /mode spread|funding|spot_futures|futures_futures|all")
+            await message.reply_text("Usage: /mode spread|funding|spot_futures|futures_futures|all")
             return
         mode = context.args[0].lower()
         allowed = {"spread", "funding", "spot_futures", "futures_futures", "all"}
         if mode not in allowed:
-            await update.message.reply_text("Invalid mode")
+            await message.reply_text("Invalid mode")
             return
         settings.mode = mode
         settings.save_to_file(SETTINGS_FILE)
-        await update.message.reply_text(f"Mode set to {mode}")
+        await message.reply_text(f"Mode set to {mode}")
+
+    async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await auth_check(update):
+            return
+        message = update.effective_message
+        if not message:
+            return
+        await cmd_show(update, context)
+
+    async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await auth_check(update):
+            return
+        message = update.effective_message
+        if not message:
+            return
+        if not context.args:
+            await message.reply_text("Usage: /debug ETH")
+            return
+        sym = context.args[0].upper()
+        info = latest_symbol_debug.get(sym)
+        if not info:
+            await message.reply_text(f"Нет данных debug по {sym} пока.")
+            return
+        await message.reply_text(
+            f"DEBUG {sym}\n"
+            f"futures_exchanges={info.get('futures_exchanges')}\n"
+            f"spot_exchanges={info.get('spot_exchanges')}\n"
+            f"cuts={info.get('cuts')}\n"
+            f"best_candidate={info.get('best_candidate')}"
+        )
+
+    async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await auth_check(update):
+            return
+        query = update.callback_query
+        if not query:
+            return
+        await query.answer()
+        if query.data == "toggle_alerts":
+            settings.auto_alerts_enabled = not settings.auto_alerts_enabled
+            settings.save_to_file(SETTINGS_FILE)
+            await query.message.reply_text(f"Автоуведомления: {'ВКЛ' if settings.auto_alerts_enabled else 'ВЫКЛ'}")
+            return
+        if query.data == "status":
+            await cmd_status(update, context)
+            return
+        if query.data == "help":
+            await cmd_start(update, context)
+            return
+        mode_map = {
+            "scan_all": None,
+            "scan_spread": "spread",
+            "scan_funding": "funding",
+            "scan_spot_futures": "spot_futures",
+        }
+        if query.data in mode_map:
+            await send_top_signals(query.message, mode_map[query.data])
 
     app_builder = Application.builder().token(cfg.TELEGRAM_TOKEN)
     if cfg.PROXY_LIST:
@@ -764,7 +968,10 @@ async def start_telegram_bot() -> Application:
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CallbackQueryHandler(on_button))
 
     await app.initialize()
     await app.start()
