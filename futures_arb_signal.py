@@ -1,578 +1,817 @@
 import asyncio
-import aiohttp
-import time
+from collections import Counter, defaultdict
 import json
-import os
-from typing import Set, Optional, Dict, Any
 import logging
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import aiohttp
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 import config as cfg
 from proxy_manager import TelegramProxyManager
 
 SETTINGS_FILE = "settings.json"
-COOLDOWN_SECONDS = 60
+LOG_PATH = Path("logs/arb_bot.log")
+EXCHANGES = ("bybit", "bingx", "kucoin")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("arb_scanner")
+logger = logging.getLogger("arb_bot")
+
+
+@dataclass
+class MarketTop:
+    bid: float
+    ask: float
+    bid_qty: float
+    ask_qty: float
+
+
+@dataclass
+class Opportunity:
+    symbol: str
+    mode: str
+    buy_exchange: str
+    sell_exchange: str
+    buy_price: float
+    sell_price: float
+    buy_qty: float
+    sell_qty: float
+    max_executable_size_usdt: float
+    capital_usdt: float
+    trade_size_usdt: float
+    min_24h_volume_usdt: float
+    gross_spread_pct: float
+    fees_pct: float
+    net_spread_pct: float
+    funding_buy: Optional[float] = None
+    funding_sell: Optional[float] = None
+    net_funding_pct: float = 0.0
+    total_edge_pct: float = 0.0
+    estimated_spread_pnl_usdt: float = 0.0
+    estimated_funding_pnl_usdt: float = 0.0
+    estimated_total_pnl_usdt: float = 0.0
+    buy_link: str = ""
+    sell_link: str = ""
 
 
 class Settings:
-    def __init__(self):
+    def __init__(self) -> None:
         self.min_profit_pct = cfg.DEFAULT_MIN_PROFIT_PCT
         self.min_volume_usdt = cfg.DEFAULT_MIN_VOLUME_USDT
-        self.filtered_symbols: Optional[Set[str]] = set(cfg.DEFAULT_SYMBOLS) if cfg.DEFAULT_SYMBOLS else None
+        self.min_funding_pct = cfg.DEFAULT_MIN_FUNDING_PCT
+        self.min_24h_volume_usdt = cfg.DEFAULT_MIN_24H_VOLUME_USDT
+        self.capital_usdt = cfg.DEFAULT_CAPITAL_USDT
+        self.min_trade_size_usdt = cfg.DEFAULT_MIN_TRADE_SIZE_USDT
+        self.filtered_symbols: Optional[set[str]] = set(cfg.DEFAULT_SYMBOLS) if cfg.DEFAULT_SYMBOLS else None
+        self.mode = cfg.DEFAULT_MODE
+        self.log_max_mb = cfg.DEFAULT_LOG_MAX_MB
+        self.log_backups = cfg.DEFAULT_LOG_BACKUPS
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "min_profit_pct": self.min_profit_pct,
             "min_volume_usdt": self.min_volume_usdt,
-            "filtered_symbols": list(self.filtered_symbols) if self.filtered_symbols else None,
+            "min_funding_pct": self.min_funding_pct,
+            "min_24h_volume_usdt": self.min_24h_volume_usdt,
+            "capital_usdt": self.capital_usdt,
+            "min_trade_size_usdt": self.min_trade_size_usdt,
+            "filtered_symbols": sorted(self.filtered_symbols) if self.filtered_symbols else None,
+            "mode": self.mode,
+            "log_max_mb": self.log_max_mb,
+            "log_backups": self.log_backups,
         }
 
-    def from_dict(self, data: Dict[str, Any]):
+    def from_dict(self, data: dict[str, Any]) -> None:
         self.min_profit_pct = float(data.get("min_profit_pct", cfg.DEFAULT_MIN_PROFIT_PCT))
         self.min_volume_usdt = float(data.get("min_volume_usdt", cfg.DEFAULT_MIN_VOLUME_USDT))
+        self.min_funding_pct = float(data.get("min_funding_pct", cfg.DEFAULT_MIN_FUNDING_PCT))
+        self.min_24h_volume_usdt = float(data.get("min_24h_volume_usdt", cfg.DEFAULT_MIN_24H_VOLUME_USDT))
+        self.capital_usdt = float(data.get("capital_usdt", cfg.DEFAULT_CAPITAL_USDT))
+        self.min_trade_size_usdt = float(data.get("min_trade_size_usdt", cfg.DEFAULT_MIN_TRADE_SIZE_USDT))
         syms = data.get("filtered_symbols")
-        self.filtered_symbols = set(syms) if syms else None
+        self.filtered_symbols = {s.upper() for s in syms} if syms else None
+        self.mode = str(data.get("mode", cfg.DEFAULT_MODE)).lower()
+        self.log_max_mb = max(1, int(data.get("log_max_mb", cfg.DEFAULT_LOG_MAX_MB)))
+        self.log_backups = max(1, int(data.get("log_backups", cfg.DEFAULT_LOG_BACKUPS)))
 
-    def reset_to_default(self):
-        self.min_profit_pct = cfg.DEFAULT_MIN_PROFIT_PCT
-        self.min_volume_usdt = cfg.DEFAULT_MIN_VOLUME_USDT
-        self.filtered_symbols = set(cfg.DEFAULT_SYMBOLS) if cfg.DEFAULT_SYMBOLS else None
+    def reset_to_default(self) -> None:
+        self.__init__()
 
-    def save_to_file(self, filename: str):
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+    def save_to_file(self, filename: str) -> None:
+        temp = f"{filename}.tmp"
+        with open(temp, "w", encoding="utf-8") as fh:
+            json.dump(self.to_dict(), fh, ensure_ascii=False, indent=2)
+        os.replace(temp, filename)
 
-    def load_from_file(self, filename: str):
-        if os.path.exists(filename):
-            try:
-                with open(filename, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.from_dict(data)
-                logger.info("Настройки загружены из %s", os.path.abspath(filename))
-            except Exception as e:
-                logger.warning("Ошибка загрузки настроек: %s. Используем значения по умолчанию.", e)
-        else:
-            logger.info("Файл %s не найден — создаём по умолчанию.", filename)
+    def load_from_file(self, filename: str) -> None:
+        if not os.path.exists(filename):
+            self.save_to_file(filename)
+            return
+        try:
+            with open(filename, "r", encoding="utf-8") as fh:
+                self.from_dict(json.load(fh))
+        except Exception as exc:
+            logger.warning("Failed loading settings, using defaults: %s", exc)
+            self.reset_to_default()
             self.save_to_file(filename)
 
 
 settings = Settings()
-last_signal_times: Dict[str, float] = {}
+last_signal_times: dict[str, float] = {}
 
 
-def signal_key(symbol: str, long_ex: str, short_ex: str) -> str:
-    return f"{symbol}:{long_ex}:{short_ex}"
+class Diagnostics:
+    def __init__(self) -> None:
+        self.symbols_checked = 0
+        self.signals_sent = 0
+        self.participation_count: Counter[str] = Counter()
+        self.long_count: Counter[str] = Counter()
+        self.short_count: Counter[str] = Counter()
+        self.cut_reasons: dict[str, Counter[str]] = defaultdict(Counter)
+
+    def reset(self) -> None:
+        self.__init__()
+
+    def cut(self, exchange: str, reason: str) -> None:
+        self.cut_reasons[exchange][reason] += 1
+
+    def summary(self, cycle_no: int) -> None:
+        logger.info(
+            "SUMMARY cycle=%s symbols_checked=%s signals_sent=%s participation=%s long=%s short=%s cuts=%s",
+            cycle_no,
+            self.symbols_checked,
+            self.signals_sent,
+            dict(self.participation_count),
+            dict(self.long_count),
+            dict(self.short_count),
+            {ex: dict(counter) for ex, counter in self.cut_reasons.items()},
+        )
 
 
-def on_cooldown(symbol: str, long_ex: str, short_ex: str) -> bool:
-    key = signal_key(symbol, long_ex, short_ex)
+def setup_logging(max_mb: int, backups: int) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if LOG_PATH.exists() and LOG_PATH.stat().st_size > cfg.PRESTART_MAX_LOG_MB * 1024 * 1024:
+        LOG_PATH.rename(LOG_PATH.with_suffix(".log.prestart"))
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    root.addHandler(sh)
+
+    fh = RotatingFileHandler(LOG_PATH, maxBytes=max_mb * 1024 * 1024, backupCount=backups, encoding="utf-8")
+    fh.setFormatter(formatter)
+    root.addHandler(fh)
+    fh.doRollover()
+
+
+def get_mode_cooldown(mode: str) -> int:
+    return cfg.COOLDOWN_FUNDING_SECONDS if mode == "funding" else cfg.COOLDOWN_SPREAD_SECONDS
+
+
+def signal_key(symbol: str, mode: str, buy_exchange: str, sell_exchange: str) -> str:
+    return f"{symbol}:{mode}:{buy_exchange}:{sell_exchange}"
+
+
+def on_cooldown(symbol: str, mode: str, buy_exchange: str, sell_exchange: str) -> bool:
+    key = signal_key(symbol, mode, buy_exchange, sell_exchange)
     now = time.time()
     last = last_signal_times.get(key, 0)
-    if now - last < COOLDOWN_SECONDS:
+    if now - last < get_mode_cooldown(mode):
         return True
     last_signal_times[key] = now
     return False
 
 
-def get_pair(exchange: str, base: str) -> str:
-    return {
-        "bybit": f"{base}USDT",
-        "bingx": f"{base}-USDT",
-        "kucoin": f"{base}USDTM",
-    }[exchange]
+def market_link(exchange: str, symbol: str, market_type: str) -> str:
+    if exchange == "bybit":
+        if market_type == "spot":
+            return f"https://www.bybit.com/trade/spot/{symbol}USDT"
+        return f"https://www.bybit.com/trade/usdt/{symbol}USDT"
+    if exchange == "bingx":
+        if market_type == "spot":
+            return f"https://bingx.com/en/spot/{symbol}USDT"
+        return f"https://bingx.com/en-us/futures/forward/{symbol}USDT"
+    if exchange == "kucoin":
+        if market_type == "spot":
+            return f"https://www.kucoin.com/trade/{symbol}-USDT"
+        return f"https://www.kucoin.com/futures/trade/{symbol}USDTM"
+    return ""
 
 
-def fmt_ex(exchange: str) -> str:
-    return exchange.upper()
+def get_fee(exchange: str, market_type: str) -> float:
+    return cfg.FEES.get(exchange, {}).get(market_type, 0.001)
 
 
-def fmt_fr_value(fr: Optional[float]) -> str:
-    return f"{fr * 100:.4f}%" if fr is not None else "N/A"
+def ts_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def funding_side_text(rate: Optional[float], side: str) -> str:
+def funding_text(rate: Optional[float], side: str) -> str:
     if rate is None:
         return "N/A"
     pct = abs(rate) * 100
+    side = side.upper()
+
+    if side not in {"LONG", "SHORT"}:
+        return f"{side} funding {rate * 100:.4f}%"
+
     if rate > 0:
-        return f"{side} {'платит' if side == 'LONG' else 'получает'} {pct:.4f}%"
-    if rate < 0:
-        return f"{side} {'получает' if side == 'LONG' else 'платит'} {pct:.4f}%"
-    return f"{side} funding 0.0000%"
+        # Positive funding: LONG pays SHORT.
+        action = "pays" if side == "LONG" else "receives"
+    elif rate < 0:
+        # Negative funding: SHORT pays LONG.
+        action = "receives" if side == "LONG" else "pays"
+    else:
+        return f"{side} funding 0.0000%"
+
+    return f"{side} {action} {pct:.4f}%"
 
 
-async def start_telegram_bot():
-    from telegram.ext import Application, CommandHandler, ContextTypes
-    from telegram import Update
+async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[dict[str, Any]]:
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT_SECONDS)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+    except asyncio.TimeoutError:
+        return None
+    except Exception:
+        return None
 
-    allowed_id = str(cfg.TELEGRAM_CHAT_ID)
-    proxy_url = cfg.PROXY_LIST[0] if cfg.PROXY_LIST else None
+
+async def fetch_json_with_reason(session: aiohttp.ClientSession, url: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT_SECONDS)) as resp:
+            if resp.status == 429:
+                return None, "rate limit"
+            if resp.status != 200:
+                return None, f"http {resp.status}"
+            return await resp.json(), None
+    except asyncio.TimeoutError:
+        return None, "timeout"
+    except Exception:
+        return None, "network error"
+
+
+async def fetch_symbol_maps(session: aiohttp.ClientSession) -> dict[str, dict[str, set[str]]]:
+    maps = {"spot": {ex: set() for ex in EXCHANGES}, "futures": {ex: set() for ex in EXCHANGES}}
+
+    bybit_f = await fetch_json(session, "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000")
+    if bybit_f and bybit_f.get("retCode") == 0:
+        for item in bybit_f["result"]["list"]:
+            if item.get("quoteCoin") == "USDT" and item.get("status") == "Trading":
+                maps["futures"]["bybit"].add(item["baseCoin"])
+
+    bybit_s = await fetch_json(session, "https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000")
+    if bybit_s and bybit_s.get("retCode") == 0:
+        for item in bybit_s["result"]["list"]:
+            if item.get("quoteCoin") == "USDT" and item.get("status") == "Trading":
+                maps["spot"]["bybit"].add(item["baseCoin"])
+
+    bingx_f = await fetch_json(session, "https://open-api.bingx.com/openApi/swap/v2/quote/contracts")
+    if bingx_f and bingx_f.get("code") == "0":
+        for item in bingx_f.get("data", []):
+            symbol = item.get("symbol", "")
+            if symbol.endswith("-USDT") and item.get("status") == 1:
+                maps["futures"]["bingx"].add(symbol.replace("-USDT", ""))
+
+    bingx_s = await fetch_json(session, "https://open-api.bingx.com/openApi/spot/v1/common/symbols")
+    if bingx_s and int(bingx_s.get("code", 1)) == 0:
+        for item in bingx_s.get("data", {}).get("symbols", []):
+            symbol = item.get("symbol", "")
+            if symbol.endswith("-USDT") and item.get("status") in (1, "1", "TRADING"):
+                maps["spot"]["bingx"].add(symbol.replace("-USDT", ""))
+
+    ku_f = await fetch_json(session, "https://api-futures.kucoin.com/api/v1/contracts/active")
+    if ku_f and ku_f.get("code") == "200000":
+        for item in ku_f.get("data", []):
+            if item.get("settleCurrency") == "USDT" and item.get("status") == "Open":
+                maps["futures"]["kucoin"].add(item.get("baseCurrency"))
+
+    ku_s = await fetch_json(session, "https://api.kucoin.com/api/v2/symbols")
+    if ku_s and ku_s.get("code") == "200000":
+        for item in ku_s.get("data", []):
+            if item.get("quoteCurrency") == "USDT" and item.get("enableTrading"):
+                maps["spot"]["kucoin"].add(item.get("baseCurrency"))
+
+    return maps
+
+
+async def fetch_futures_book(session: aiohttp.ClientSession, exchange: str, symbol: str) -> tuple[Optional[MarketTop], Optional[str]]:
+    if exchange == "bybit":
+        data, reason = await fetch_json_with_reason(session, f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={symbol}USDT&limit=1")
+        if reason:
+            return None, reason
+        if data and data.get("retCode") == 0 and data["result"].get("a") and data["result"].get("b"):
+            return MarketTop(float(data["result"]["b"][0][0]), float(data["result"]["a"][0][0]), float(data["result"]["b"][0][1]), float(data["result"]["a"][0][1])), None
+    elif exchange == "bingx":
+        data, reason = await fetch_json_with_reason(session, f"https://open-api.bingx.com/openApi/swap/v2/quote/bookTicker?symbol={symbol}-USDT")
+        if reason:
+            return None, reason
+        top = (data or {}).get("data", {}).get("book_ticker")
+        if data and data.get("code") == "0" and top:
+            return MarketTop(float(top["bid_price"]), float(top["ask_price"]), float(top["bid_qty"]), float(top["ask_qty"])), None
+    elif exchange == "kucoin":
+        data, reason = await fetch_json_with_reason(session, f"https://api-futures.kucoin.com/api/v1/level2/snapshot?symbol={symbol}USDTM")
+        if reason:
+            return None, reason
+        if data and data.get("code") == "200000":
+            bids = data["data"].get("bids") or []
+            asks = data["data"].get("asks") or []
+            if bids and asks:
+                return MarketTop(float(bids[0][0]), float(asks[0][0]), float(bids[0][1]), float(asks[0][1])), None
+    return None, "no orderbook"
+
+
+async def fetch_spot_book(session: aiohttp.ClientSession, exchange: str, symbol: str) -> tuple[Optional[MarketTop], Optional[str]]:
+    if exchange == "bybit":
+        data, reason = await fetch_json_with_reason(session, f"https://api.bybit.com/v5/market/orderbook?category=spot&symbol={symbol}USDT&limit=1")
+        if reason:
+            return None, reason
+        if data and data.get("retCode") == 0 and data["result"].get("a") and data["result"].get("b"):
+            return MarketTop(float(data["result"]["b"][0][0]), float(data["result"]["a"][0][0]), float(data["result"]["b"][0][1]), float(data["result"]["a"][0][1])), None
+    elif exchange == "bingx":
+        data, reason = await fetch_json_with_reason(session, f"https://open-api.bingx.com/openApi/spot/v1/ticker/bookTicker?symbol={symbol}-USDT")
+        if reason:
+            return None, reason
+        if data and int(data.get("code", 1)) == 0 and data.get("data"):
+            top = data["data"]
+            return MarketTop(float(top["bidPrice"]), float(top["askPrice"]), float(top.get("bidQty", 0)), float(top.get("askQty", 0))), None
+    elif exchange == "kucoin":
+        data, reason = await fetch_json_with_reason(session, f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}-USDT")
+        if reason:
+            return None, reason
+        if data and data.get("code") == "200000" and data.get("data"):
+            top = data["data"]
+            return MarketTop(float(top["bestBid"]), float(top["bestAsk"]), float(top.get("bestBidSize", 0)), float(top.get("bestAskSize", 0))), None
+    return None, "no orderbook"
+
+
+async def fetch_funding(session: aiohttp.ClientSession, exchange: str, symbol: str) -> Optional[float]:
+    if exchange == "bybit":
+        data = await fetch_json(session, f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}USDT")
+        if data and data.get("retCode") == 0 and data["result"]["list"]:
+            return float(data["result"]["list"][0].get("fundingRate", 0))
+    elif exchange == "bingx":
+        data = await fetch_json(session, f"https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex?symbol={symbol}-USDT")
+        if data and data.get("code") == "0" and data.get("data"):
+            return float(data["data"].get("lastFundingRate", 0))
+    elif exchange == "kucoin":
+        data = await fetch_json(session, f"https://api-futures.kucoin.com/api/v1/contracts/{symbol}USDTM")
+        if data and data.get("code") == "200000" and data.get("data"):
+            return float(data["data"].get("fundingFeeRate", 0))
+    return None
+
+
+async def fetch_24h_volume(session: aiohttp.ClientSession, exchange: str, symbol: str, market_type: str) -> Optional[float]:
+    if exchange == "bybit":
+        category = "spot" if market_type == "spot" else "linear"
+        data = await fetch_json(session, f"https://api.bybit.com/v5/market/tickers?category={category}&symbol={symbol}USDT")
+        if data and data.get("retCode") == 0 and data["result"]["list"]:
+            item = data["result"]["list"][0]
+            if market_type == "spot":
+                return float(item.get("turnover24h", 0) or 0)
+            return float(item.get("turnover24h", 0) or 0)
+    elif exchange == "bingx":
+        if market_type == "spot":
+            data = await fetch_json(session, f"https://open-api.bingx.com/openApi/spot/v1/ticker/24hr?symbol={symbol}-USDT")
+            if data and int(data.get("code", 1)) == 0 and data.get("data"):
+                return float(data["data"].get("quoteVolume", 0) or 0)
+        else:
+            data = await fetch_json(session, f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}-USDT")
+            if data and data.get("code") == "0" and data.get("data"):
+                return float(data["data"].get("quoteVolume", 0) or data["data"].get("amount", 0) or 0)
+    elif exchange == "kucoin":
+        if market_type == "spot":
+            data = await fetch_json(session, f"https://api.kucoin.com/api/v1/market/stats?symbol={symbol}-USDT")
+            if data and data.get("code") == "200000" and data.get("data"):
+                return float(data["data"].get("volValue", 0) or 0)
+        else:
+            data = await fetch_json(session, f"https://api-futures.kucoin.com/api/v1/contracts/{symbol}USDTM")
+            if data and data.get("code") == "200000" and data.get("data"):
+                return float(data["data"].get("turnoverOf24h", 0) or 0)
+    return None
+
+
+def calc_opportunity(
+    symbol: str,
+    mode: str,
+    buy_exchange: str,
+    sell_exchange: str,
+    buy_book: MarketTop,
+    sell_book: MarketTop,
+    buy_market: str,
+    sell_market: str,
+    buy_24h_volume_usdt: float,
+    sell_24h_volume_usdt: float,
+    capital_usdt: float,
+    funding_buy: Optional[float] = None,
+    funding_sell: Optional[float] = None,
+) -> Opportunity:
+    gross = ((sell_book.bid - buy_book.ask) / buy_book.ask) * 100
+    fees_pct = (get_fee(buy_exchange, buy_market) + get_fee(sell_exchange, sell_market)) * 100
+    net_spread_pct = gross - fees_pct
+    max_size = min(buy_book.ask * buy_book.ask_qty, sell_book.bid * sell_book.bid_qty)
+    trade_size = min(capital_usdt, max_size)
+    min_24h_volume = min(buy_24h_volume_usdt, sell_24h_volume_usdt)
+    net_funding_pct = 0.0
+    total_edge_pct = net_spread_pct
+    if funding_buy is not None and funding_sell is not None:
+        net_funding_pct = (funding_sell - funding_buy) * 100
+        total_edge_pct = net_spread_pct + net_funding_pct
+
+    return Opportunity(
+        symbol=symbol,
+        mode=mode,
+        buy_exchange=buy_exchange,
+        sell_exchange=sell_exchange,
+        buy_price=buy_book.ask,
+        sell_price=sell_book.bid,
+        buy_qty=buy_book.ask_qty,
+        sell_qty=sell_book.bid_qty,
+        max_executable_size_usdt=max_size,
+        capital_usdt=capital_usdt,
+        trade_size_usdt=trade_size,
+        min_24h_volume_usdt=min_24h_volume,
+        gross_spread_pct=gross,
+        fees_pct=fees_pct,
+        net_spread_pct=net_spread_pct,
+        funding_buy=funding_buy,
+        funding_sell=funding_sell,
+        net_funding_pct=net_funding_pct,
+        total_edge_pct=total_edge_pct,
+        estimated_spread_pnl_usdt=trade_size * (net_spread_pct / 100),
+        estimated_funding_pnl_usdt=trade_size * (net_funding_pct / 100),
+        estimated_total_pnl_usdt=trade_size * (total_edge_pct / 100),
+        buy_link=market_link(buy_exchange, symbol, buy_market),
+        sell_link=market_link(sell_exchange, symbol, sell_market),
+    )
+
+
+def format_signal(opp: Opportunity) -> str:
+    return (
+        f"💎 <b>ARBITRAGE SIGNAL</b>\n"
+        f"Coin: <b>{opp.symbol}/USDT</b>\n"
+        f"Type: <code>{opp.mode}</code>\n\n"
+        f"🟢 BUY/LONG: <b>{opp.buy_exchange.upper()}</b>\n"
+        f"Price: <code>{opp.buy_price:.6f}</code> | Qty: <code>{opp.buy_qty:.4f}</code>\n"
+        f"Link: {opp.buy_link}\n\n"
+        f"🔴 SELL/SHORT: <b>{opp.sell_exchange.upper()}</b>\n"
+        f"Price: <code>{opp.sell_price:.6f}</code> | Qty: <code>{opp.sell_qty:.4f}</code>\n"
+        f"Link: {opp.sell_link}\n\n"
+        f"Capital: <code>{opp.capital_usdt:,.2f} USDT</code>\n"
+        f"24h volume (min side): <code>{opp.min_24h_volume_usdt:,.2f} USDT</code>\n"
+        f"Max executable size: <code>{opp.max_executable_size_usdt:,.2f} USDT</code>\n"
+        f"Trade size: <code>{opp.trade_size_usdt:,.2f} USDT</code>\n"
+        f"Gross spread: <code>{opp.gross_spread_pct:.4f}%</code>\n"
+        f"Fees: <code>{opp.fees_pct:.4f}%</code>\n"
+        f"Spread edge: <code>{opp.net_spread_pct:+.4f}%</code>\n"
+        f"Funding buy/sell: <code>{'N/A' if opp.funding_buy is None else f'{opp.funding_buy*100:.4f}%'} / {'N/A' if opp.funding_sell is None else f'{opp.funding_sell*100:.4f}%'}</code>\n"
+        f"Funding explain: <code>{funding_text(opp.funding_buy, 'LONG')} | {funding_text(opp.funding_sell, 'SHORT')}</code>\n"
+        f"Funding edge: <code>{opp.net_funding_pct:+.4f}%</code>\n"
+        f"Total edge: <b>{opp.total_edge_pct:+.4f}%</b>\n"
+        f"Estimated spread PnL: <code>{opp.estimated_spread_pnl_usdt:,.2f} USDT</code>\n"
+        f"Estimated funding PnL: <code>{opp.estimated_funding_pnl_usdt:,.2f} USDT</code>\n"
+        f"Estimated total PnL: <b>{opp.estimated_total_pnl_usdt:,.2f} USDT</b>\n"
+        f"Time: {ts_utc()}"
+    )
+
+
+async def scan_symbol(
+    session: aiohttp.ClientSession,
+    tg: TelegramProxyManager,
+    symbol: str,
+    maps: dict[str, dict[str, set[str]]],
+    diagnostics: Diagnostics,
+) -> None:
+    diagnostics.symbols_checked += 1
+    futures_ex = [ex for ex in EXCHANGES if symbol in maps["futures"][ex]]
+    spot_ex = [ex for ex in EXCHANGES if symbol in maps["spot"][ex]]
+    for exchange in EXCHANGES:
+        if exchange not in futures_ex and exchange not in spot_ex:
+            diagnostics.cut(exchange, "no symbol")
+
+    opportunities: list[Opportunity] = []
+
+    async def get_side_24h(exchange: str, market: str) -> float:
+        value = await fetch_24h_volume(session, exchange, symbol, market)
+        return value if value is not None else 0.0
+
+    if settings.mode in ("all", "spread", "futures_futures", "funding") and len(futures_ex) >= 2:
+        results = await asyncio.gather(*[fetch_futures_book(session, ex, symbol) for ex in futures_ex])
+        books: dict[str, MarketTop] = {}
+        for ex, (book, reason) in zip(futures_ex, results):
+            if book:
+                books[ex] = book
+                diagnostics.participation_count[ex] += 1
+            else:
+                diagnostics.cut(ex, reason or "no orderbook")
+        logger.info("ORDERBOOK futures symbol=%s available=%s", symbol, sorted(books.keys()))
+        if len(books) >= 2:
+            long_ex = min(books, key=lambda x: books[x].ask)
+            short_ex = max(books, key=lambda x: books[x].bid)
+            if long_ex != short_ex:
+                if settings.mode in ("all", "spread", "futures_futures"):
+                    long_vol_24h, short_vol_24h = await asyncio.gather(
+                        get_side_24h(long_ex, "futures"),
+                        get_side_24h(short_ex, "futures"),
+                    )
+                    opportunities.append(
+                        calc_opportunity(
+                            symbol,
+                            "futures_futures",
+                            long_ex,
+                            short_ex,
+                            books[long_ex],
+                            books[short_ex],
+                            "futures",
+                            "futures",
+                            long_vol_24h,
+                            short_vol_24h,
+                            settings.capital_usdt,
+                        )
+                    )
+                if settings.mode in ("all", "funding"):
+                    f_long, f_short, long_vol_24h, short_vol_24h = await asyncio.gather(
+                        fetch_funding(session, long_ex, symbol),
+                        fetch_funding(session, short_ex, symbol),
+                        get_side_24h(long_ex, "futures"),
+                        get_side_24h(short_ex, "futures"),
+                    )
+                    opportunities.append(
+                        calc_opportunity(
+                            symbol,
+                            "funding",
+                            long_ex,
+                            short_ex,
+                            books[long_ex],
+                            books[short_ex],
+                            "futures",
+                            "futures",
+                            long_vol_24h,
+                            short_vol_24h,
+                            settings.capital_usdt,
+                            f_long,
+                            f_short,
+                        )
+                    )
+
+    if settings.mode in ("all", "spread", "spot_futures") and spot_ex and futures_ex:
+        spot_results = await asyncio.gather(*[fetch_spot_book(session, ex, symbol) for ex in spot_ex])
+        fut_results = await asyncio.gather(*[fetch_futures_book(session, ex, symbol) for ex in futures_ex])
+        spot_books: dict[str, MarketTop] = {}
+        fut_books: dict[str, MarketTop] = {}
+        for ex, (book, reason) in zip(spot_ex, spot_results):
+            if book:
+                spot_books[ex] = book
+                diagnostics.participation_count[ex] += 1
+            else:
+                diagnostics.cut(ex, reason or "no orderbook")
+        for ex, (book, reason) in zip(futures_ex, fut_results):
+            if book:
+                fut_books[ex] = book
+                diagnostics.participation_count[ex] += 1
+            else:
+                diagnostics.cut(ex, reason or "no orderbook")
+        logger.info("ORDERBOOK spot symbol=%s available=%s | futures available=%s", symbol, sorted(spot_books.keys()), sorted(fut_books.keys()))
+        if spot_books and fut_books:
+            buy_ex = min(spot_books, key=lambda x: spot_books[x].ask)
+            sell_ex = max(fut_books, key=lambda x: fut_books[x].bid)
+            buy_vol_24h, sell_vol_24h = await asyncio.gather(
+                get_side_24h(buy_ex, "spot"),
+                get_side_24h(sell_ex, "futures"),
+            )
+            opportunities.append(
+                calc_opportunity(
+                    symbol,
+                    "spot_futures",
+                    buy_ex,
+                    sell_ex,
+                    spot_books[buy_ex],
+                    fut_books[sell_ex],
+                    "spot",
+                    "futures",
+                    buy_vol_24h,
+                    sell_vol_24h,
+                    settings.capital_usdt,
+                )
+            )
+
+    for opp in opportunities:
+        if opp.max_executable_size_usdt < settings.min_volume_usdt:
+            diagnostics.cut(opp.buy_exchange, "low top-of-book volume")
+            diagnostics.cut(opp.sell_exchange, "low top-of-book volume")
+            continue
+        if opp.trade_size_usdt < settings.min_trade_size_usdt:
+            continue
+        if opp.min_24h_volume_usdt < settings.min_24h_volume_usdt:
+            diagnostics.cut(opp.buy_exchange, "low 24h volume")
+            diagnostics.cut(opp.sell_exchange, "low 24h volume")
+            continue
+        if opp.net_spread_pct < 0:
+            diagnostics.cut(opp.buy_exchange, "negative spread after fees")
+            diagnostics.cut(opp.sell_exchange, "negative spread after fees")
+            continue
+        if opp.mode == "funding":
+            if opp.total_edge_pct < settings.min_profit_pct:
+                continue
+        else:
+            if opp.net_spread_pct < settings.min_profit_pct:
+                continue
+
+        if on_cooldown(opp.symbol, opp.mode, opp.buy_exchange, opp.sell_exchange):
+            continue
+
+        diagnostics.long_count[opp.buy_exchange] += 1
+        diagnostics.short_count[opp.sell_exchange] += 1
+        diagnostics.signals_sent += 1
+        await tg.send_message(cfg.TELEGRAM_CHAT_ID, format_signal(opp))
+
+
+async def start_telegram_bot() -> Application:
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
+
+    allowed_chat_id = str(cfg.TELEGRAM_CHAT_ID)
 
     async def auth_check(update: Update) -> bool:
-        user_id = str(update.effective_user.id) if update.effective_user else ""
-        username = update.effective_user.username if update.effective_user else None
-        logger.info("Команда от user_id=%s username=@%s", user_id, username)
-        if user_id != allowed_id:
+        chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+        if chat_id != allowed_chat_id:
             if update.message:
-                await update.message.reply_text("🔒 У вас нет доступа к этому боту.")
+                await update.message.reply_text("🔒 Access denied")
             return False
         return True
 
-    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
-        syms = ", ".join(sorted(settings.filtered_symbols)) if settings.filtered_symbols else "ВСЕ доступные"
-        msg = (
-            "🚀 <b>Арбитражный сканер запущен!</b>\n"
-            "Поддерживаемые биржи: <b>BYBIT + BINGX + KUCOIN</b>\n"
-            "Логика позиции: <b>LONG на дешёвой бирже, SHORT на дорогой</b>\n"
-            "Funding: <b>при положительном funding LONG платит SHORT, при отрицательном SHORT платит LONG</b>\n"
-            f"📉 Мин. прибыль: <code>{settings.min_profit_pct:.3f}%</code>\n"
-            f"💵 Мин. объём: <code>${settings.min_volume_usdt:,.0f}</code>\n"
-            f"🌕 Монеты: <code>{syms}</code>\n\n"
-            "Команды:\n"
-            "<code>/show</code>\n"
-            "<code>/set min_profit 0.15</code>\n"
-            "<code>/set min_volume 5000</code>\n"
-            "<code>/set symbols BTC,ETH,SOL</code>\n"
-            "<code>/set symbols ALL</code>\n"
-            "<code>/reset</code>"
+        await update.message.reply_text(
+            "Bot online.\n"
+            "Commands:\n"
+            "/show\n"
+            "/set min_profit 0.2\n"
+            "/set min_volume 1000\n"
+            "/set min_24h_volume 1000000\n"
+            "/set min_trade_size 50\n"
+            "/set capital 1000\n"
+            "/set min_funding 0.03\n"
+            "/set symbols BTC,ETH,SOL\n"
+            "/set symbols ALL\n"
+            "/mode spread|funding|spot_futures|futures_futures|all\n"
+            "/reset",
+            parse_mode="HTML",
         )
-        await update.message.reply_text(msg, parse_mode="HTML")
 
-    async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
-        syms = ", ".join(sorted(settings.filtered_symbols)) if settings.filtered_symbols else "ВСЕ доступные"
-        msg = (
-            "<b>Текущие настройки:</b>\n"
-            f"• Мин. прибыль: <code>{settings.min_profit_pct:.3f}%</code>\n"
-            f"• Мин. объём: <code>${settings.min_volume_usdt:,.0f} USDT</code>\n"
-            f"• Монеты: <code>{syms}</code>\n"
-            "• Биржи: <code>BYBIT, BINGX, KUCOIN</code>\n"
-            "• Направления: <code>LONG / SHORT</code>"
+        symbols = "ALL" if not settings.filtered_symbols else ",".join(sorted(settings.filtered_symbols))
+        await update.message.reply_text(
+            f"Режим: {settings.mode}\n"
+            f"Мин. профит: {settings.min_profit_pct:.3f}%\n"
+            f"Мин. исполнимый объём: ${settings.min_volume_usdt:,.0f} USDT\n"
+            f"Мин. объём за 24ч: ${settings.min_24h_volume_usdt:,.0f} USDT\n"
+            f"Мин. размер сделки: ${settings.min_trade_size_usdt:,.0f} USDT\n"
+            f"Капитал: ${settings.capital_usdt:,.0f} USDT\n"
+            f"Мин. funding: {settings.min_funding_pct:.3f}% (info only)\n"
+            f"Символы: {symbols}\n"
+            f"log_max_mb={settings.log_max_mb}\n"
+            f"log_backups={settings.log_backups}"
         )
-        await update.message.reply_text(msg, parse_mode="HTML")
 
-    async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
         settings.reset_to_default()
-        settings.filtered_symbols = None
         settings.save_to_file(SETTINGS_FILE)
-        await update.message.reply_text("🔄 Настройки сброшены. Теперь ищутся ВСЕ доступные монеты.")
+        await update.message.reply_text("Settings reset")
 
-    async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
-
-        text = update.message.text or ""
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
+        args = context.args
+        if len(args) < 2:
             await update.message.reply_text(
-                "🛠 Использование:\n"
+                "Usage:\n"
                 "/set min_profit 0.2\n"
-                "/set min_volume 10000\n"
-                "/set symbols BTC,ETH,SOL\n"
+                "/set min_volume 1000\n"
+                "/set min_24h_volume 1000000\n"
+                "/set min_trade_size 50\n"
+                "/set capital 1000\n"
+                "/set min_funding 0.03\n"
+                "/set symbols BTC,ETH\n"
                 "/set symbols ALL"
             )
             return
-
-        _, key, value = parts
-        key = key.lower().strip()
-        value = value.strip()
-
+        key = args[0].lower()
+        value = " ".join(args[1:]).strip()
         try:
             if key == "min_profit":
                 settings.min_profit_pct = float(value)
-                msg = f"✅ min_profit = {settings.min_profit_pct}%"
             elif key == "min_volume":
                 settings.min_volume_usdt = float(value)
-                msg = f"✅ min_volume = ${settings.min_volume_usdt:,.0f} USDT"
+            elif key == "min_funding":
+                settings.min_funding_pct = float(value)
+            elif key == "min_24h_volume":
+                settings.min_24h_volume_usdt = float(value)
+            elif key == "min_trade_size":
+                settings.min_trade_size_usdt = float(value)
+            elif key == "capital":
+                settings.capital_usdt = float(value)
             elif key == "symbols":
-                if value.upper() in {"ALL", "ВСЕ", "*"}:
+                if value.upper() == "ALL":
                     settings.filtered_symbols = None
-                    msg = "✅ Символы: ВСЕ доступные"
                 else:
-                    syms = [s.strip().upper() for s in value.split(",") if s.strip()]
-                    settings.filtered_symbols = set(syms) if syms else None
-                    msg = f"✅ Символы: {', '.join(sorted(settings.filtered_symbols)) if settings.filtered_symbols else 'ВСЕ доступные'}"
+                    settings.filtered_symbols = {s.strip().upper() for s in value.split(",") if s.strip()}
             else:
-                msg = "❌ Неизвестный параметр. Используй: min_profit, min_volume, symbols"
-
+                await update.message.reply_text("Unknown key")
+                return
             settings.save_to_file(SETTINGS_FILE)
-            await update.message.reply_text(msg)
-        except ValueError as e:
-            logger.error("Ошибка в /set: %s", e)
-            await update.message.reply_text(
-                "🛠 Использование:\n"
-                "/set min_profit 0.2\n"
-                "/set min_volume 10000\n"
-                "/set symbols BTC,ETH,SOL\n"
-                "/set symbols ALL"
-            )
+            await update.message.reply_text("Updated")
+        except ValueError:
+            await update.message.reply_text("Invalid value")
 
-    builder = Application.builder().token(cfg.TELEGRAM_TOKEN)
-    if proxy_url:
-        builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+    async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await auth_check(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /mode spread|funding|spot_futures|futures_futures|all")
+            return
+        mode = context.args[0].lower()
+        allowed = {"spread", "funding", "spot_futures", "futures_futures", "all"}
+        if mode not in allowed:
+            await update.message.reply_text("Invalid mode")
+            return
+        settings.mode = mode
+        settings.save_to_file(SETTINGS_FILE)
+        await update.message.reply_text(f"Mode set to {mode}")
 
-    app = builder.build()
+    app_builder = Application.builder().token(cfg.TELEGRAM_TOKEN)
+    if cfg.PROXY_LIST:
+        app_builder = app_builder.proxy(cfg.PROXY_LIST[0]).get_updates_proxy(cfg.PROXY_LIST[0])
+    app = app_builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("reset", cmd_reset))
 
-    logger.info("Запуск Telegram-бота в режиме polling")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     return app
 
 
-async def get_all_bybit_symbols(session: aiohttp.ClientSession) -> Set[str]:
-    url = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-    symbols: Set[str] = set()
-    try:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            if data.get("retCode") == 0:
-                for item in data["result"]["list"]:
-                    if (
-                        item.get("quoteCoin") == "USDT"
-                        and item.get("contractType") == "LinearPerpetual"
-                        and item.get("status") == "Trading"
-                    ):
-                        symbols.add(item["baseCoin"])
-    except Exception as e:
-        logger.warning("[Bybit] Ошибка списка символов: %s", e)
-    return symbols
-
-
-async def get_all_bingx_symbols(session: aiohttp.ClientSession) -> Set[str]:
-    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
-    symbols: Set[str] = set()
-    try:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            if data.get("code") == "0":
-                for item in data.get("data", []):
-                    sym = item.get("symbol", "")
-                    if sym.endswith("-USDT") and item.get("status") == 1:
-                        symbols.add(sym.replace("-USDT", ""))
-    except Exception as e:
-        logger.warning("[BingX] Ошибка списка символов: %s", e)
-    return symbols
-
-
-async def get_all_kucoin_symbols(session: aiohttp.ClientSession) -> Set[str]:
-    url = "https://api-futures.kucoin.com/api/v1/contracts/active"
-    symbols: Set[str] = set()
-    try:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            if data.get("code") == "200000":
-                for item in data.get("data", []):
-                    if (
-                        not item.get("isInverse")
-                        and item.get("settleCurrency") == "USDT"
-                        and item.get("status") == "Open"
-                    ):
-                        base = item.get("baseCurrency", "")
-                        if base:
-                            symbols.add(base)
-    except Exception as e:
-        logger.warning("[KuCoin] Ошибка списка символов: %s", e)
-    return symbols
-
-
-async def update_symbol_map(session: aiohttp.ClientSession) -> Dict[str, Set[str]]:
-    bybit, bingx, kucoin = await asyncio.gather(
-        get_all_bybit_symbols(session),
-        get_all_bingx_symbols(session),
-        get_all_kucoin_symbols(session),
-    )
-    return {"bybit": bybit, "bingx": bingx, "kucoin": kucoin}
-
-
-async def fetch_orderbook(session: aiohttp.ClientSession, exchange: str, symbol: str):
-    pair = get_pair(exchange, symbol)
-    timeout = aiohttp.ClientTimeout(total=8)
-
-    try:
-        if exchange == "bybit":
-            url = f"https://api.bybit.com/v5/market/orderbook?category=linear&symbol={pair}&limit=1"
-            async with session.get(url, timeout=timeout) as resp:
-                data = await resp.json()
-                if data.get("retCode") == 0:
-                    b = data["result"]
-                    if b.get("b") and b.get("a"):
-                        return {
-                            "bid": float(b["b"][0][0]),
-                            "ask": float(b["a"][0][0]),
-                            "bid_qty": float(b["b"][0][1]),
-                            "ask_qty": float(b["a"][0][1]),
-                        }
-
-        elif exchange == "bingx":
-            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/bookTicker?symbol={pair}"
-            async with session.get(url, timeout=timeout) as resp:
-                data = await resp.json()
-                if data.get("code") == "0" and data.get("data", {}).get("book_ticker"):
-                    b = data["data"]["book_ticker"]
-                    return {
-                        "bid": float(b["bid_price"]),
-                        "ask": float(b["ask_price"]),
-                        "bid_qty": float(b["bid_qty"]),
-                        "ask_qty": float(b["ask_qty"]),
-                    }
-
-        elif exchange == "kucoin":
-            url = f"https://api-futures.kucoin.com/api/v1/level2/snapshot?symbol={pair}"
-            async with session.get(url, timeout=timeout) as resp:
-                data = await resp.json()
-                if data.get("code") == "200000" and data.get("data"):
-                    d = data["data"]
-                    bids = d.get("bids") or []
-                    asks = d.get("asks") or []
-                    if bids and asks:
-                        return {
-                            "bid": float(bids[0][0]),
-                            "ask": float(asks[0][0]),
-                            "bid_qty": float(bids[0][1]),
-                            "ask_qty": float(asks[0][1]),
-                        }
-    except asyncio.TimeoutError:
-        logger.warning("TIMEOUT orderbook %s %s", exchange, symbol)
-    except Exception as e:
-        logger.warning("ERROR orderbook %s %s: %s", exchange, symbol, e)
-
-    return None
-
-
-async def fetch_funding_rate(session: aiohttp.ClientSession, exchange: str, symbol: str):
-    pair = get_pair(exchange, symbol)
-    timeout = aiohttp.ClientTimeout(total=8)
-
-    try:
-        if exchange == "bybit":
-            url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={pair}"
-            async with session.get(url, timeout=timeout) as resp:
-                data = await resp.json()
-                if data.get("retCode") == 0 and data["result"]["list"]:
-                    return float(data["result"]["list"][0]["fundingRate"])
-
-        elif exchange == "bingx":
-            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex?symbol={pair}"
-            async with session.get(url, timeout=timeout) as resp:
-                data = await resp.json()
-                if data.get("code") == "0" and data.get("data"):
-                    return float(data["data"]["lastFundingRate"])
-
-        elif exchange == "kucoin":
-            url = f"https://api-futures.kucoin.com/api/v1/contracts/{pair}"
-            async with session.get(url, timeout=timeout) as resp:
-                data = await resp.json()
-                if data.get("code") == "200000" and data.get("data"):
-                    value = data["data"].get("fundingFeeRate")
-                    return float(value) if value is not None else None
-    except Exception as e:
-        logger.warning("ERROR funding %s %s: %s", exchange, symbol, e)
-
-    return None
-
-
-async def scan_symbol(session: aiohttp.ClientSession, tg: TelegramProxyManager, symbol: str, available_on: Set[str]):
-    exchanges = [ex for ex in ["bybit", "bingx", "kucoin"] if ex in available_on]
-    results = await asyncio.gather(*[fetch_orderbook(session, ex, symbol) for ex in exchanges])
-
-    books = {}
-    for ex, result in zip(exchanges, results):
-        if result:
-            books[ex] = result
-
-    if len(books) < 2:
-        logger.info("CUT %s: books<2 books=%s", symbol, list(books.keys()))
-        return
-
-    long_ex = min(books, key=lambda e: books[e]["ask"])
-    short_ex = max(books, key=lambda e: books[e]["bid"])
-
-    if long_ex == short_ex:
-        logger.info("CUT %s: same_exchange=%s", symbol, long_ex)
-        return
-
-    long_price = books[long_ex]["ask"]
-    short_price = books[short_ex]["bid"]
-    long_qty = books[long_ex]["ask_qty"]
-    short_qty = books[short_ex]["bid_qty"]
-
-    long_vol_usdt = long_price * long_qty
-    short_vol_usdt = short_price * short_qty
-
-    if long_vol_usdt < settings.min_volume_usdt or short_vol_usdt < settings.min_volume_usdt:
-        logger.info(
-            "CUT %s: volume long_vol=%.2f short_vol=%.2f min=%.2f",
-            symbol,
-            long_vol_usdt,
-            short_vol_usdt,
-            settings.min_volume_usdt,
-        )
-        return
-
-    if long_price <= 0 or short_price <= long_price:
-        logger.info("CUT %s: price long=%.6f short=%.6f", symbol, long_price, short_price)
-        return
-
-    fee_long = cfg.FEES.get(long_ex, 0.001)
-    fee_short = cfg.FEES.get(short_ex, 0.001)
-    total_fee_pct = (fee_long + fee_short) * 100
-    gross_pct = (short_price - long_price) / long_price * 100
-    net_pct = gross_pct - total_fee_pct
-
-    logger.info(
-        "DEBUG %s: long=%s %.6f short=%s %.6f gross=%.4f%% net=%.4f%% long_vol=%.2f short_vol=%.2f",
-        symbol,
-        long_ex,
-        long_price,
-        short_ex,
-        short_price,
-        gross_pct,
-        net_pct,
-        long_vol_usdt,
-        short_vol_usdt,
-    )
-
-    if net_pct < settings.min_profit_pct:
-        logger.info("CUT %s: net_pct=%.4f min_profit=%.4f", symbol, net_pct, settings.min_profit_pct)
-        return
-
-    if on_cooldown(symbol, long_ex, short_ex):
-        logger.info("CUT %s: cooldown %s->%s", symbol, long_ex, short_ex)
-        return
-
-    fr_long, fr_short = await asyncio.gather(
-        fetch_funding_rate(session, long_ex, symbol),
-        fetch_funding_rate(session, short_ex, symbol),
-    )
-
-    net_funding = None
-    if fr_long is not None and fr_short is not None:
-        net_funding = fr_short - fr_long
-
-    if net_funding is None:
-        funding_comment = "⚪ Funding: N/A"
-    elif net_funding > 0:
-        funding_comment = f"💚 По funding позиция в плюс: +{net_funding * 100:.4f}%"
-    elif net_funding < 0:
-        funding_comment = f"🔴 По funding позиция в минус: {net_funding * 100:.4f}%"
-    else:
-        funding_comment = "⚪ Funding нейтральный"
-
-    msg = (
-        f"💎 <b>АРБИТРАЖ СИГНАЛ</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 <b>{symbol}/USDT</b>\n\n"
-        f"🟢 <b>LONG</b> → {fmt_ex(long_ex)}\n"
-        f"   └ Ask:     <code>${long_price:.6f}</code>\n"
-        f"   └ Объём:   <code>{long_qty:.4f}</code> (${long_vol_usdt:,.0f})\n"
-        f"   └ Funding: <code>{fmt_fr_value(fr_long)}</code>\n"
-        f"   └ {funding_side_text(fr_long, 'LONG')}\n\n"
-        f"🔴 <b>SHORT</b> → {fmt_ex(short_ex)}\n"
-        f"   └ Bid:     <code>${short_price:.6f}</code>\n"
-        f"   └ Объём:   <code>{short_qty:.4f}</code> (${short_vol_usdt:,.0f})\n"
-        f"   └ Funding: <code>{fmt_fr_value(fr_short)}</code>\n"
-        f"   └ {funding_side_text(fr_short, 'SHORT')}\n\n"
-        f"📊 <b>P&L:</b>\n"
-        f"   └ Грубая прибыль:  <code>{gross_pct:.3f}%</code>\n"
-        f"   └ Комиссии:        <code>-{total_fee_pct:.3f}%</code>\n"
-        f"   └ ✅ Чистая:        <b>{net_pct:.3f}%</b>\n"
-        f"   └ {funding_comment}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕒 {time.strftime('%H:%M:%S')} UTC"
-    )
-
-    logger.info("SIGNAL %s | LONG %s -> SHORT %s | net=%.3f%%", symbol, fmt_ex(long_ex), fmt_ex(short_ex), net_pct)
-    await tg.send_message(cfg.TELEGRAM_CHAT_ID, msg)
-
-
-async def main():
+async def main() -> None:
     settings.load_from_file(SETTINGS_FILE)
+    setup_logging(settings.log_max_mb, settings.log_backups)
 
     tg = TelegramProxyManager(cfg.TELEGRAM_TOKEN, cfg.PROXY_LIST)
     await tg.initialize()
+    app = await start_telegram_bot()
 
-    bot_app = await start_telegram_bot()
-
-    connector = aiohttp.TCPConnector(limit=30)
+    connector = aiohttp.TCPConnector(limit=50)
+    diagnostics = Diagnostics()
+    cycle_no = 0
     async with aiohttp.ClientSession(connector=connector) as session:
-        symbol_map = await update_symbol_map(session)
+        symbol_maps = await fetch_symbol_maps(session)
         last_update = time.time()
 
-        eligible = sorted({
-            sym
-            for sym in (symbol_map["bybit"] | symbol_map["bingx"] | symbol_map["kucoin"])
-            if sum(sym in s for s in symbol_map.values()) >= 2
-        })
+        while True:
+            if time.time() - last_update > cfg.UPDATE_PAIRS_INTERVAL:
+                symbol_maps = await fetch_symbol_maps(session)
+                last_update = time.time()
 
-        shown_syms = ", ".join(sorted(settings.filtered_symbols)) if settings.filtered_symbols else "ВСЕ доступные"
-        await tg.send_message(
-            cfg.TELEGRAM_CHAT_ID,
-            f"🚀 <b>Арбитражный сканер запущен!</b>\n"
-            f"📦 Монет доступно (>=2 биржи): {len(eligible)}\n"
-            f"📉 Мин. прибыль: {settings.min_profit_pct:.3f}%\n"
-            f"💵 Мин. объём: ${settings.min_volume_usdt:,.0f}\n"
-            f"🌕 Монеты: {shown_syms}\n"
-            f"🏦 Биржи: BYBIT + BINGX + KUCOIN\n"
-            f"📌 Логика: LONG на дешёвой бирже, SHORT на дорогой"
-        )
+            all_symbols = sorted(set().union(*symbol_maps["futures"].values(), *symbol_maps["spot"].values()))
+            scan_symbols = [s for s in all_symbols if not settings.filtered_symbols or s in settings.filtered_symbols]
 
-        try:
-            while True:
-                if time.time() - last_update > getattr(cfg, "UPDATE_PAIRS_INTERVAL", 1800):
-                    symbol_map = await update_symbol_map(session)
-                    last_update = time.time()
-                    eligible = sorted({
-                        sym
-                        for sym in (symbol_map["bybit"] | symbol_map["bingx"] | symbol_map["kucoin"])
-                        if sum(sym in s for s in symbol_map.values()) >= 2
-                    })
-                    logger.info("Обновлён список монет: %s", len(eligible))
+            cycle_no += 1
+            tasks = [scan_symbol(session, tg, symbol, symbol_maps, diagnostics) for symbol in scan_symbols]
+            for i in range(0, len(tasks), cfg.BATCH_SIZE):
+                batch = tasks[i : i + cfg.BATCH_SIZE]
+                await asyncio.gather(*batch, return_exceptions=True)
+                await asyncio.sleep(0.3)
 
-                if settings.filtered_symbols:
-                    symbols_to_scan = [s for s in sorted(settings.filtered_symbols) if s in eligible]
-                else:
-                    symbols_to_scan = eligible
+            if cycle_no % cfg.SUMMARY_EVERY_CYCLES == 0:
+                diagnostics.summary(cycle_no)
+                diagnostics.reset()
 
-                logger.info("LOOP symbols=%s", len(symbols_to_scan))
+            await asyncio.sleep(cfg.SCAN_INTERVAL)
 
-                tasks = []
-                for sym in symbols_to_scan:
-                    available_on = {ex for ex, syms in symbol_map.items() if sym in syms}
-                    if len(available_on) >= 2:
-                        tasks.append(scan_symbol(session, tg, sym, available_on))
-
-                for i in range(0, len(tasks), cfg.BATCH_SIZE):
-                    batch = tasks[i:i + cfg.BATCH_SIZE]
-                    await asyncio.gather(*batch)
-                    await asyncio.sleep(1.0)
-
-                await asyncio.sleep(cfg.SCAN_INTERVAL)
-
-        except KeyboardInterrupt:
-            logger.info("Сканер остановлен вручную")
-        finally:
-            await bot_app.updater.stop()
-            await bot_app.stop()
-            await bot_app.shutdown()
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Сканер остановлен вручную")
+    asyncio.run(main())
