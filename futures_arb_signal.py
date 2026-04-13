@@ -537,19 +537,32 @@ async def start_telegram_bot() -> Application:
     async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
-        await update.message.reply_text("Bot online. Commands: /show /set /mode /reset", parse_mode="HTML")
+        await update.message.reply_text(
+            "Bot online.\n"
+            "Commands:\n"
+            "/show\n"
+            "/set min_profit 0.2\n"
+            "/set min_volume 1000\n"
+            "/set min_24h_volume 1000000\n"
+            "/set min_funding 0.03\n"
+            "/set symbols BTC,ETH,SOL\n"
+            "/set symbols ALL\n"
+            "/mode spread|funding|spot_futures|futures_futures|all\n"
+            "/reset",
+            parse_mode="HTML",
+        )
 
     async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await auth_check(update):
             return
         symbols = "ALL" if not settings.filtered_symbols else ",".join(sorted(settings.filtered_symbols))
         await update.message.reply_text(
-            f"mode={settings.mode}\n"
-            f"min_profit={settings.min_profit_pct}\n"
-            f"min_volume={settings.min_volume_usdt}\n"
-            f"min_funding={settings.min_funding_pct} (info only)\n"
-            f"min_24h_volume={settings.min_24h_volume_usdt}\n"
-            f"symbols={symbols}\n"
+            f"Режим: {settings.mode}\n"
+            f"Мин. профит: {settings.min_profit_pct:.3f}%\n"
+            f"Мин. исполнимый объём: ${settings.min_volume_usdt:,.0f} USDT\n"
+            f"Мин. объём за 24ч: ${settings.min_24h_volume_usdt:,.0f} USDT\n"
+            f"Мин. funding: {settings.min_funding_pct:.3f}% (info only)\n"
+            f"Символы: {symbols}\n"
             f"log_max_mb={settings.log_max_mb}\n"
             f"log_backups={settings.log_backups}"
         )
@@ -566,7 +579,15 @@ async def start_telegram_bot() -> Application:
             return
         args = context.args
         if len(args) < 2:
-            await update.message.reply_text("Usage: /set min_profit 0.2 | /set min_volume 1000 | /set min_24h_volume 500000 | /set min_funding 0.03 | /set symbols BTC,ETH | /set symbols ALL")
+            await update.message.reply_text(
+                "Usage:\n"
+                "/set min_profit 0.2\n"
+                "/set min_volume 1000\n"
+                "/set min_24h_volume 1000000\n"
+                "/set min_funding 0.03\n"
+                "/set symbols BTC,ETH\n"
+                "/set symbols ALL"
+            )
             return
         key = args[0].lower()
         value = " ".join(args[1:]).strip()
