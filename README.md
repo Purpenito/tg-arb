@@ -67,14 +67,13 @@ python3 futures_arb_signal.py
 - `/status`
 - `/set symbols BTC,ETH,SOL`
 - `/set symbols ALL`
-- `/mode spread`
-- `/mode funding`
-- `/mode spot_futures`
 - `/mode futures_futures`
+- `/mode funding`
 - `/mode all`
 
+> Фокус интерфейса — `futures_futures` и `funding`.  
 > В режиме `funding` фильтрация идёт по `total edge` (spread edge + funding edge).  
-> В режиме `spread`/`spot_futures`/`futures_futures` фильтрация идёт по `spread edge`.  
+> В режиме `futures_futures` фильтрация идёт по `spread edge`.  
 > Также применяется фильтр `min_24h_volume` (минимум 24h объёма по двум сторонам сделки).
 
 ## Пример запуска в tmux

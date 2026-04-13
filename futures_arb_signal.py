@@ -543,7 +543,7 @@ async def scan_symbol(
         value = await fetch_24h_volume(session, exchange, symbol, market)
         return value if value is not None else 0.0
 
-    if settings.mode in ("all", "spread", "futures_futures", "funding") and len(futures_ex) >= 2:
+    if settings.mode in ("all", "futures_futures", "funding") and len(futures_ex) >= 2:
         results = await asyncio.gather(*[fetch_futures_book(session, ex, symbol) for ex in futures_ex])
         books: dict[str, MarketTop] = {}
         for ex, (book, reason) in zip(futures_ex, results):
@@ -558,7 +558,7 @@ async def scan_symbol(
             long_ex = min(books, key=lambda x: books[x].ask)
             short_ex = max(books, key=lambda x: books[x].bid)
             if long_ex != short_ex:
-                if settings.mode in ("all", "spread", "futures_futures"):
+                if settings.mode in ("all", "futures_futures"):
                     long_vol_24h, short_vol_24h = await asyncio.gather(
                         get_side_24h(long_ex, "futures"),
                         get_side_24h(short_ex, "futures"),
@@ -602,49 +602,6 @@ async def scan_symbol(
                             f_short,
                         )
                     )
-
-    if settings.mode in ("all", "spread", "spot_futures") and spot_ex and futures_ex:
-        spot_results = await asyncio.gather(*[fetch_spot_book(session, ex, symbol) for ex in spot_ex])
-        fut_results = await asyncio.gather(*[fetch_futures_book(session, ex, symbol) for ex in futures_ex])
-        spot_books: dict[str, MarketTop] = {}
-        fut_books: dict[str, MarketTop] = {}
-        for ex, (book, reason) in zip(spot_ex, spot_results):
-            if book:
-                spot_books[ex] = book
-                diagnostics.participation_count[ex] += 1
-            else:
-                diagnostics.cut(ex, reason or "no orderbook")
-                debug_info["cuts"].append(f"{ex}: {reason or 'no orderbook'}")
-        for ex, (book, reason) in zip(futures_ex, fut_results):
-            if book:
-                fut_books[ex] = book
-                diagnostics.participation_count[ex] += 1
-            else:
-                diagnostics.cut(ex, reason or "no orderbook")
-                debug_info["cuts"].append(f"{ex}: {reason or 'no orderbook'}")
-        logger.info("ORDERBOOK spot symbol=%s available=%s | futures available=%s", symbol, sorted(spot_books.keys()), sorted(fut_books.keys()))
-        if spot_books and fut_books:
-            buy_ex = min(spot_books, key=lambda x: spot_books[x].ask)
-            sell_ex = max(fut_books, key=lambda x: fut_books[x].bid)
-            buy_vol_24h, sell_vol_24h = await asyncio.gather(
-                get_side_24h(buy_ex, "spot"),
-                get_side_24h(sell_ex, "futures"),
-            )
-            opportunities.append(
-                calc_opportunity(
-                    symbol,
-                    "spot_futures",
-                    buy_ex,
-                    sell_ex,
-                    spot_books[buy_ex],
-                    fut_books[sell_ex],
-                    "spot",
-                    "futures",
-                    buy_vol_24h,
-                    sell_vol_24h,
-                    settings.capital_usdt,
-                )
-            )
 
     for opp in opportunities:
         if opp.max_executable_size_usdt < settings.min_volume_usdt:
@@ -730,10 +687,9 @@ async def start_telegram_bot() -> Application:
 
     def main_menu() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("Проверить всё", callback_data="scan_all"), InlineKeyboardButton("Только spread", callback_data="scan_spread")],
-            [InlineKeyboardButton("Только funding", callback_data="scan_funding"), InlineKeyboardButton("Только spot-futures", callback_data="scan_spot_futures")],
-            [InlineKeyboardButton("Уведомления ВКЛ/ВЫКЛ", callback_data="toggle_alerts"), InlineKeyboardButton("Статус", callback_data="status")],
-            [InlineKeyboardButton("Помощь", callback_data="help")],
+            [InlineKeyboardButton("⚡ Проверить всё", callback_data="scan_all"), InlineKeyboardButton("📈 Futures-Futures", callback_data="scan_futures")],
+            [InlineKeyboardButton("💸 Funding", callback_data="scan_funding"), InlineKeyboardButton("🔔 Автоуведомления", callback_data="toggle_alerts")],
+            [InlineKeyboardButton("📊 Статус", callback_data="status"), InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
         ])
 
     async def send_top_signals(message, forced_mode: Optional[str] = None) -> None:
@@ -742,10 +698,7 @@ async def start_telegram_bot() -> Application:
             return
         filtered = list(latest_candidates.values())
         if forced_mode:
-            if forced_mode == "spread":
-                filtered = [o for o in filtered if o.mode in {"futures_futures", "spot_futures"}]
-            else:
-                filtered = [o for o in filtered if o.mode == forced_mode]
+            filtered = [o for o in filtered if o.mode == forced_mode]
         filtered.sort(key=lambda x: x.total_edge_pct, reverse=True)
         limited = filtered[: settings.max_results]
         for opp in limited:
@@ -758,8 +711,9 @@ async def start_telegram_bot() -> Application:
         if not message:
             return
         await message.reply_text(
-            "Bot online.\n"
-            "Commands:\n"
+            "🚀 <b>Арбитраж-терминал готов</b>\n"
+            "Основные направления: <b>futures-futures</b> и <b>funding</b>.\n\n"
+            "Команды:\n"
             "/show\n"
             "/set min_profit 0.2\n"
             "/set min_volume 1000\n"
@@ -772,7 +726,7 @@ async def start_telegram_bot() -> Application:
             "/set alerts on|off\n"
             "/set symbols BTC,ETH,SOL\n"
             "/set symbols ALL\n"
-            "/mode spread|funding|spot_futures|futures_futures|all\n"
+            "/mode futures_futures|funding|all\n"
             "/debug ETH\n"
             "/status\n"
             "/reset",
@@ -794,7 +748,7 @@ async def start_telegram_bot() -> Application:
             f"Мин. объём за 24ч: ${settings.min_24h_volume_usdt:,.0f} USDT\n"
             f"Мин. размер сделки: ${settings.min_trade_size_usdt:,.0f} USDT\n"
             f"Капитал: ${settings.capital_usdt:,.0f} USDT\n"
-            f"Мин. funding: {settings.min_funding_pct:.3f}% (info only)\n"
+            f"Мин. funding edge: {settings.min_funding_pct:.3f}%\n"
             f"Funding weight: {settings.funding_weight:.2f}\n"
             f"Max negative entry spread (funding): {settings.max_negative_entry_spread_pct:.3f}%\n"
             f"Активные биржи: {', '.join(settings.enabled_exchanges)}\n"
@@ -892,10 +846,10 @@ async def start_telegram_bot() -> Application:
         if not message:
             return
         if not context.args:
-            await message.reply_text("Usage: /mode spread|funding|spot_futures|futures_futures|all")
+            await message.reply_text("Usage: /mode futures_futures|funding|all")
             return
         mode = context.args[0].lower()
-        allowed = {"spread", "funding", "spot_futures", "futures_futures", "all"}
+        allowed = {"funding", "futures_futures", "all"}
         if mode not in allowed:
             await message.reply_text("Invalid mode")
             return
@@ -953,9 +907,8 @@ async def start_telegram_bot() -> Application:
             return
         mode_map = {
             "scan_all": None,
-            "scan_spread": "spread",
+            "scan_futures": "futures_futures",
             "scan_funding": "funding",
-            "scan_spot_futures": "spot_futures",
         }
         if query.data in mode_map:
             await send_top_signals(query.message, mode_map[query.data])
